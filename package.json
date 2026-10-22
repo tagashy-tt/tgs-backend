@@ -1,0 +1,18 @@
+{
+  "name": "tay-studio-premium-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend starter for TAY'S STUDIO Premium, PayPal and feature entitlements",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0"
+  }
+}
