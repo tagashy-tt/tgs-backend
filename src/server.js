@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -32,21 +31,30 @@ const required = [
 ];
 
 const missing = required.filter(key => !process.env[key]);
+
 if (missing.length) {
   console.warn(`Missing environment variables: ${missing.join(', ')}`);
 }
 
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 app.disable('x-powered-by');
 
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
+
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 ||
-        allowedOrigins.includes(origin)) {
+    if (
+      !origin ||
+      allowedOrigins.length === 0 ||
+      allowedOrigins.includes(origin)
+    ) {
       return callback(null, true);
     }
+
     return callback(new Error('Origin not allowed by CORS'));
   }
 }));
@@ -73,6 +81,7 @@ function hashToken(token) {
 
 function isOwner(user) {
   const ownerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+
   return Boolean(
     ownerEmail &&
     user &&
@@ -108,6 +117,43 @@ function entitlementStatus(row, now = Date.now()) {
   };
 }
 
+function validMoney(value) {
+  return typeof value === 'string' &&
+    /^\d+(\.\d{1,2})?$/.test(value) &&
+    Number.isFinite(Number(value)) &&
+    Number(value) > 0;
+}
+
+function configuredLifetimePrice() {
+  const price = process.env.PAYPAL_LIFETIME_PRICE_USD;
+
+  if (!validMoney(price)) {
+    throw httpError(503, 'Lifetime price is not configured');
+  }
+
+  return Number(price).toFixed(2);
+}
+
+function configuredSubscriptionPlan(plan) {
+  if (plan === 'monthly') {
+    return {
+      id: process.env.PAYPAL_PLAN_MONTHLY_ID,
+      price: '2.99',
+      intervalDays: 31
+    };
+  }
+
+  if (plan === 'yearly') {
+    return {
+      id: process.env.PAYPAL_PLAN_YEARLY_ID,
+      price: '29.99',
+      intervalDays: 366
+    };
+  }
+
+  return null;
+}
+
 async function getUser(req, _res, next) {
   try {
     requireConfig();
@@ -118,9 +164,12 @@ async function getUser(req, _res, next) {
     if (!match) throw httpError(401, 'Sign-in required');
 
     const token = match[1].trim();
+
     if (token.length < 32 || token.length > 512) {
       throw httpError(401, 'Invalid session');
     }
+
+    const tokenHash = hashToken(token);
 
     const result = await pool.query(
       `SELECT u.id, u.email, u.email_verified_at, u.created_at
@@ -130,16 +179,20 @@ async function getUser(req, _res, next) {
          AND s.revoked_at IS NULL
          AND s.expires_at > NOW()
        LIMIT 1`,
-      [hashToken(token)]
+      [tokenHash]
     );
 
-    if (!result.rows.length) throw httpError(401, 'Invalid or expired session');
+    if (!result.rows.length) {
+      throw httpError(401, 'Invalid or expired session');
+    }
 
     req.user = result.rows[0];
 
     await pool.query(
-      'UPDATE app_sessions SET last_used_at = NOW() WHERE token_hash = $1',
-      [hashToken(token)]
+      `UPDATE app_sessions
+       SET last_used_at = NOW()
+       WHERE token_hash = $1`,
+      [tokenHash]
     );
 
     next();
@@ -151,10 +204,12 @@ async function getUser(req, _res, next) {
 async function createSession(user, req) {
   const token = crypto.randomBytes(48).toString('base64url');
   const tokenHash = hashToken(token);
-  const days = Math.min(
-    30,
-    Math.max(1, Number(process.env.SESSION_TTL_DAYS || 30))
-  );
+
+  const configuredDays = Number(process.env.SESSION_TTL_DAYS || 30);
+
+  const days = Number.isFinite(configuredDays)
+    ? Math.min(30, Math.max(1, Math.floor(configuredDays)))
+    : 30;
 
   await pool.query(
     `INSERT INTO app_sessions
@@ -173,8 +228,10 @@ async function createSession(user, req) {
 }
 
 async function paypalAccessToken() {
-  if (!process.env.PAYPAL_CLIENT_ID ||
-      !process.env.PAYPAL_CLIENT_SECRET) {
+  if (
+    !process.env.PAYPAL_CLIENT_ID ||
+    !process.env.PAYPAL_CLIENT_SECRET
+  ) {
     throw httpError(503, 'PayPal is not configured');
   }
 
@@ -193,7 +250,8 @@ async function paypalAccessToken() {
   });
 
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
+
+  if (!response.ok || !body.access_token) {
     console.error('PayPal OAuth failed:', response.status);
     throw httpError(502, 'Could not authenticate with PayPal');
   }
@@ -253,7 +311,8 @@ async function hasPremium(user) {
   if (isOwner(user)) return true;
 
   const result = await pool.query(
-    `SELECT 1 FROM user_entitlements
+    `SELECT 1
+     FROM user_entitlements
      WHERE user_id = $1
        AND feature = 'premium'
        AND active = TRUE
@@ -265,13 +324,18 @@ async function hasPremium(user) {
   return result.rowCount > 0;
 }
 
+/*
+ * Health
+ */
+
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
+
     res.json({
       ok: true,
       service: 'tay-studio-backend',
-      version: '0.2.0',
+      version: '0.3.0',
       database: 'connected'
     });
   } catch {
@@ -282,6 +346,10 @@ app.get('/health', async (_req, res) => {
     });
   }
 });
+
+/*
+ * Plans
+ */
 
 app.get('/api/v1/plans', (_req, res) => {
   res.json({
@@ -303,13 +371,18 @@ app.get('/api/v1/plans', (_req, res) => {
         id: 'lifetime',
         type: 'one_time',
         label: 'Premium Lifetime',
-        configured: Boolean(process.env.PAYPAL_LIFETIME_PRICE_USD)
+        configured: validMoney(
+          process.env.PAYPAL_LIFETIME_PRICE_USD
+        )
       }
     ]
   });
 });
 
-// Registration. Email verification must be added before public production.
+/*
+ * Authentication
+ */
+
 app.post('/api/v1/auth/register', async (req, res, next) => {
   try {
     requireConfig();
@@ -317,9 +390,13 @@ app.post('/api/v1/auth/register', async (req, res, next) => {
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password || '');
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    if (
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      email.length > 254
+    ) {
       throw httpError(400, 'Invalid email');
     }
+
     if (password.length < 12 || password.length > 128) {
       throw httpError(400, 'Password must be 12–128 characters');
     }
@@ -338,7 +415,6 @@ app.post('/api/v1/auth/register', async (req, res, next) => {
       throw httpError(409, 'An account with that email may already exist');
     }
 
-    // Registration never accepts a role or Premium status from the client.
     res.status(201).json({
       user: safeUser(result.rows[0]),
       message: 'Account created. Email verification is not yet implemented.'
@@ -361,16 +437,21 @@ app.post('/api/v1/auth/login', async (req, res, next) => {
 
     const result = await pool.query(
       `SELECT id, email, password_hash, email_verified_at, created_at
-       FROM app_users WHERE lower(email) = $1 LIMIT 1`,
+       FROM app_users
+       WHERE lower(email) = $1
+       LIMIT 1`,
       [email]
     );
 
     const user = result.rows[0];
+
     const valid = user
       ? await bcrypt.compare(password, user.password_hash)
       : false;
 
-    if (!valid) throw httpError(401, 'Invalid email or password');
+    if (!valid) {
+      throw httpError(401, 'Invalid email or password');
+    }
 
     const session = await createSession(user, req);
 
@@ -387,11 +468,15 @@ app.post('/api/v1/auth/login', async (req, res, next) => {
 
 app.post('/api/v1/auth/logout', getUser, async (req, res, next) => {
   try {
-    const token = req.headers.authorization.replace(/^Bearer\s+/i, '').trim();
+    const token = req.headers.authorization
+      .replace(/^Bearer\s+/i, '')
+      .trim();
 
     await pool.query(
-      `UPDATE app_sessions SET revoked_at = NOW()
-       WHERE token_hash = $1 AND revoked_at IS NULL`,
+      `UPDATE app_sessions
+       SET revoked_at = NOW()
+       WHERE token_hash = $1
+         AND revoked_at IS NULL`,
       [hashToken(token)]
     );
 
@@ -400,6 +485,10 @@ app.post('/api/v1/auth/logout', getUser, async (req, res, next) => {
     next(error);
   }
 });
+
+/*
+ * Current user
+ */
 
 app.get('/api/v1/me', getUser, async (req, res) => {
   res.json({
@@ -414,13 +503,17 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
 
     const result = await pool.query(
       `SELECT feature, active, expires_at, source, external_id, updated_at
-       FROM user_entitlements WHERE user_id = $1`,
+       FROM user_entitlements
+       WHERE user_id = $1`,
       [req.user.id]
     );
 
     const entitlements = result.rows.map(row => entitlementStatus(row));
     const active = entitlements.filter(row => row.active);
-    const premium = owner || active.some(row => row.feature === 'premium');
+
+    const premium = owner ||
+      active.some(row => row.feature === 'premium');
+
     const premiumRow = active.find(row => row.feature === 'premium');
 
     res.json({
@@ -428,12 +521,16 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
       role: owner ? 'owner' : 'customer',
       owner,
       premium,
-      plan: owner ? 'owner'
-        : !premium ? 'free'
-        : premiumRow.accessType === 'lifetime' ? 'lifetime'
-        : 'subscription',
+      plan: owner
+        ? 'owner'
+        : !premium
+          ? 'free'
+          : premiumRow.accessType === 'lifetime'
+            ? 'lifetime'
+            : 'subscription',
       daysRemaining: owner || premiumRow?.accessType === 'lifetime'
-        ? null : (premiumRow?.daysRemaining ?? 0),
+        ? null
+        : (premiumRow?.daysRemaining ?? 0),
       expiresAt: owner ? null : (premiumRow?.expires_at ?? null),
       features: {
         processing_methods: true,
@@ -457,23 +554,26 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
   }
 });
 
-// Subscription creation. Prices and plan IDs remain server-side.
+/*
+ * PayPal subscription checkout
+ */
+
 app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
   try {
-    const plan = req.body?.plan;
-    const planId = plan === 'monthly'
-      ? process.env.PAYPAL_PLAN_MONTHLY_ID
-      : plan === 'yearly'
-        ? process.env.PAYPAL_PLAN_YEARLY_ID
-        : null;
+    const plan = String(req.body?.plan || '');
+    const configuredPlan = configuredSubscriptionPlan(plan);
 
-    if (!planId) throw httpError(400, 'Plan is not configured');
+    if (!configuredPlan?.id) {
+      throw httpError(400, 'Plan is not configured');
+    }
 
     const result = await paypalRequest('/v1/billing/subscriptions', {
       method: 'POST',
-      headers: { 'PayPal-Request-Id': crypto.randomUUID() },
+      headers: {
+        'PayPal-Request-Id': crypto.randomUUID()
+      },
       body: JSON.stringify({
-        plan_id: planId,
+        plan_id: configuredPlan.id,
         custom_id: req.user.id,
         application_context: {
           brand_name: "TAY'S STUDIO",
@@ -484,7 +584,10 @@ app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
       })
     });
 
-    const approvalUrl = result.links?.find(link => link.rel === 'approve')?.href;
+    const approvalUrl = result.links?.find(
+      link => link.rel === 'approve'
+    )?.href;
+
     if (!approvalUrl || !result.id) {
       throw httpError(502, 'PayPal did not return an approval URL');
     }
@@ -497,24 +600,28 @@ app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
       [result.id, req.user.id, plan, result.status || 'APPROVAL_PENDING']
     );
 
-    res.json({ subscriptionId: result.id, approvalUrl });
+    res.json({
+      subscriptionId: result.id,
+      approvalUrl
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// Lifetime checkout.
+/*
+ * PayPal Lifetime order creation
+ */
+
 app.post('/api/v1/paypal/lifetime/order', getUser, async (req, res, next) => {
   try {
-    const price = process.env.PAYPAL_LIFETIME_PRICE_USD;
-
-    if (!price || !/^\d+(\.\d{1,2})?$/.test(price) || Number(price) <= 0) {
-      throw httpError(503, 'Lifetime price is not configured');
-    }
+    const price = configuredLifetimePrice();
 
     const order = await paypalRequest('/v2/checkout/orders', {
       method: 'POST',
-      headers: { 'PayPal-Request-Id': crypto.randomUUID() },
+      headers: {
+        'PayPal-Request-Id': crypto.randomUUID()
+      },
       body: JSON.stringify({
         intent: 'CAPTURE',
         purchase_units: [{
@@ -523,7 +630,7 @@ app.post('/api/v1/paypal/lifetime/order', getUser, async (req, res, next) => {
           description: "TAY'S STUDIO Premium Lifetime",
           amount: {
             currency_code: 'USD',
-            value: Number(price).toFixed(2)
+            value: price
           }
         }],
         application_context: {
@@ -535,35 +642,66 @@ app.post('/api/v1/paypal/lifetime/order', getUser, async (req, res, next) => {
       })
     });
 
-    const approvalUrl = order.links?.find(link => link.rel === 'approve')?.href;
-    if (!approvalUrl) throw httpError(502, 'PayPal approval URL missing');
+    const approvalUrl = order.links?.find(
+      link => link.rel === 'approve'
+    )?.href;
 
-    res.json({ orderId: order.id, approvalUrl });
+    if (!order.id || !approvalUrl) {
+      throw httpError(502, 'PayPal approval URL missing');
+    }
+
+    res.json({
+      orderId: order.id,
+      approvalUrl
+    });
   } catch (error) {
     next(error);
   }
 });
 
+/*
+ * Lifetime capture
+ *
+ * Verify the order and capture with PayPal.
+ * The database transaction prevents a capture from being granted
+ * to another user and ensures the payment and entitlement are recorded
+ * together.
+ */
+
 app.post('/api/v1/paypal/lifetime/capture', getUser, async (req, res, next) => {
+  let client;
+
   try {
     const orderId = String(req.body?.orderId || '');
+
     if (!/^[A-Z0-9-]{8,64}$/i.test(orderId)) {
       throw httpError(400, 'Invalid orderId');
     }
 
-    const price = process.env.PAYPAL_LIFETIME_PRICE_USD;
-    if (!price || !/^\d+(\.\d{1,2})?$/.test(price)) {
-      throw httpError(503, 'Lifetime price is not configured');
-    }
+    const price = configuredLifetimePrice();
 
-    const order = await paypalRequest(
-      `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
-      {
-        method: 'POST',
-        headers: { 'PayPal-Request-Id': crypto.randomUUID() },
-        body: '{}'
-      }
+    // Read the order first, so retries do not blindly recapture it.
+    let order = await paypalRequest(
+      `/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+      { method: 'GET' }
     );
+
+    if (order.status !== 'COMPLETED') {
+      if (order.status !== 'APPROVED') {
+        throw httpError(409, 'Order is not approved for capture');
+      }
+
+      order = await paypalRequest(
+        `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
+        {
+          method: 'POST',
+          headers: {
+            'PayPal-Request-Id': `tay-lifetime-${orderId}`
+          },
+          body: '{}'
+        }
+      );
+    }
 
     const unit = order.purchase_units?.[0];
     const capture = unit?.payments?.captures?.[0];
@@ -571,168 +709,438 @@ app.post('/api/v1/paypal/lifetime/capture', getUser, async (req, res, next) => {
     if (
       order.status !== 'COMPLETED' ||
       capture?.status !== 'COMPLETED' ||
-      unit?.custom_id !== req.user.id ||
+      String(unit?.custom_id || '') !== String(req.user.id) ||
+      unit?.reference_id !== 'tay-studio-lifetime' ||
       capture?.amount?.currency_code !== 'USD' ||
-      capture?.amount?.value !== Number(price).toFixed(2)
+      capture?.amount?.value !== price ||
+      !capture?.id
     ) {
       throw httpError(409, 'Payment not verified');
     }
 
-    // A completed order must not be granted to a different account.
-    const externalId = `paypal-order:${order.id}`;
-    const existing = await pool.query(
-      `SELECT user_id FROM user_entitlements
-       WHERE feature = 'premium' AND external_id = $1`,
-      [externalId]
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const inserted = await client.query(
+      `INSERT INTO paypal_payments
+         (paypal_capture_id, user_id, payment_type,
+          amount, currency, status, event_id)
+       VALUES ($1, $2, 'lifetime', $3, 'USD', 'completed', $4)
+       ON CONFLICT (paypal_capture_id) DO NOTHING
+       RETURNING paypal_capture_id`,
+      [
+        capture.id,
+        req.user.id,
+        price,
+        `capture:${capture.id}`
+      ]
     );
 
-    if (existing.rows.length && existing.rows[0].user_id !== req.user.id) {
-      throw httpError(409, 'Order already associated with another account');
+    if (!inserted.rowCount) {
+      const existing = await client.query(
+        `SELECT user_id, payment_type, status
+         FROM paypal_payments
+         WHERE paypal_capture_id = $1`,
+        [capture.id]
+      );
+
+      const payment = existing.rows[0];
+
+      if (
+        !payment ||
+        String(payment.user_id) !== String(req.user.id) ||
+        payment.payment_type !== 'lifetime' ||
+        payment.status !== 'completed'
+      ) {
+        throw httpError(409, 'Payment already processed');
+      }
+
+      await client.query('COMMIT');
+
+      return res.json({
+        ok: true,
+        premium: true,
+        duplicate: true
+      });
     }
 
-    await setEntitlement(req.user.id, 'premium', true, {
-      source: 'paypal_lifetime',
-      external_id: externalId
-    });
+    // Do not overwrite an existing Lifetime entitlement with a subscription.
+    const current = await client.query(
+      `SELECT source, active, expires_at
+       FROM user_entitlements
+       WHERE user_id = $1 AND feature = 'premium'
+       FOR UPDATE`,
+      [req.user.id]
+    );
 
-    res.json({ ok: true, premium: true });
+    const currentEntitlement = current.rows[0];
+
+    if (
+      currentEntitlement?.source === 'paypal_lifetime' &&
+      currentEntitlement.active
+    ) {
+      await client.query('COMMIT');
+
+      return res.json({
+        ok: true,
+        premium: true,
+        alreadyLifetime: true
+      });
+    }
+
+    await client.query(
+      `INSERT INTO user_entitlements
+         (user_id, feature, active, source, expires_at, external_id, updated_at)
+       VALUES ($1, 'premium', TRUE, 'paypal_lifetime', NULL, $2, NOW())
+       ON CONFLICT (user_id, feature)
+       DO UPDATE SET
+         active = TRUE,
+         source = 'paypal_lifetime',
+         expires_at = NULL,
+         external_id = EXCLUDED.external_id,
+         updated_at = NOW()`,
+      [req.user.id, `paypal-capture:${capture.id}`]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      premium: true
+    });
   } catch (error) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+    }
+
     next(error);
+  } finally {
+    client?.release();
   }
 });
 
-// Webhooks are signature-verified with PayPal before processing.
-// Subscription events use the local subscription mapping.
-app.post('/api/v1/paypal/webhook', async (req, res, next) => {
-  try {
-    if (!process.env.PAYPAL_WEBHOOK_ID) {
-      throw httpError(503, 'Webhook ID is not configured');
-    }
+/*
+ * PayPal webhook signature verification
+ */
 
+async function verifyPayPalWebhook(event, headers) {
+  if (!process.env.PAYPAL_WEBHOOK_ID) {
+    throw httpError(503, 'Webhook ID is not configured');
+  }
+
+  const verification = await paypalRequest(
+    '/v1/notifications/verify-webhook-signature',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        auth_algo: headers['paypal-auth-algo'],
+        cert_url: headers['paypal-cert-url'],
+        transmission_id: headers['paypal-transmission-id'],
+        transmission_sig: headers['paypal-transmission-sig'],
+        transmission_time: headers['paypal-transmission-time'],
+        webhook_id: process.env.PAYPAL_WEBHOOK_ID,
+        webhook_event: event
+      })
+    }
+  );
+
+  if (verification.verification_status !== 'SUCCESS') {
+    throw httpError(400, 'Invalid webhook signature');
+  }
+}
+
+async function processSubscriptionPayment(client, resource, eventId) {
+  const subscriptionId = resource.billing_agreement_id;
+
+  if (!subscriptionId || !resource.id) {
+    return;
+  }
+
+  // Only accept payments for subscriptions created by this backend.
+  const mapping = await client.query(
+    `SELECT user_id, plan, status
+     FROM paypal_subscriptions
+     WHERE paypal_subscription_id = $1
+     FOR UPDATE`,
+    [subscriptionId]
+  );
+
+  if (!mapping.rowCount) {
+    console.warn('Ignoring payment for an unmapped PayPal subscription');
+    return;
+  }
+
+  const subscription = mapping.rows[0];
+
+  if (
+    resource.state &&
+    resource.state !== 'completed'
+  ) {
+    return;
+  }
+
+  const amount = resource.amount?.total;
+  const currency = resource.amount?.currency;
+
+  if (
+    currency !== 'USD' ||
+    !validMoney(String(amount || ''))
+  ) {
+    throw httpError(400, 'Invalid subscription payment amount');
+  }
+
+  const plan = configuredSubscriptionPlan(subscription.plan);
+
+  if (!plan || Number(amount).toFixed(2) !== plan.price) {
+    throw httpError(400, 'Subscription payment amount mismatch');
+  }
+
+  // Fetch PayPal's subscription record for its next billing date.
+  const remote = await paypalRequest(
+    `/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`,
+    { method: 'GET' }
+  );
+
+  if (
+    String(remote.custom_id || '') !== String(subscription.user_id)
+  ) {
+    throw httpError(409, 'Subscription account mismatch');
+  }
+
+  let expiresAt = remote.billing_info?.next_billing_time
+    ? new Date(remote.billing_info.next_billing_time)
+    : new Date(Date.now() + plan.intervalDays * 86400000);
+
+  if (!Number.isFinite(expiresAt.getTime())) {
+    expiresAt = new Date(Date.now() + plan.intervalDays * 86400000);
+  }
+
+  const paymentInsert = await client.query(
+    `INSERT INTO paypal_payments
+       (paypal_capture_id, user_id, payment_type,
+        paypal_subscription_id, amount, currency, status, event_id)
+     VALUES ($1, $2, 'subscription', $3, $4, 'USD', 'completed', $5)
+     ON CONFLICT (paypal_capture_id) DO NOTHING
+     RETURNING paypal_capture_id`,
+    [
+      resource.id,
+      subscription.user_id,
+      subscriptionId,
+      Number(amount).toFixed(2),
+      eventId
+    ]
+  );
+
+  // A repeated sale must never extend the entitlement again.
+  if (!paymentInsert.rowCount) {
+    return;
+  }
+
+  await client.query(
+    `UPDATE paypal_subscriptions
+     SET status = 'active', updated_at = NOW()
+     WHERE paypal_subscription_id = $1`,
+    [subscriptionId]
+  );
+
+  // Lifetime access always takes precedence over subscription access.
+  const current = await client.query(
+    `SELECT source, active
+     FROM user_entitlements
+     WHERE user_id = $1 AND feature = 'premium'
+     FOR UPDATE`,
+    [subscription.user_id]
+  );
+
+  const currentEntitlement = current.rows[0];
+
+  if (
+    currentEntitlement?.source === 'paypal_lifetime' &&
+    currentEntitlement.active
+  ) {
+    return;
+  }
+
+  await client.query(
+    `INSERT INTO user_entitlements
+       (user_id, feature, active, source, expires_at, external_id, updated_at)
+     VALUES ($1, 'premium', TRUE, 'paypal_subscription', $2, $3, NOW())
+     ON CONFLICT (user_id, feature)
+     DO UPDATE SET
+       active = TRUE,
+       source = 'paypal_subscription',
+       expires_at = GREATEST(
+         COALESCE(user_entitlements.expires_at, EXCLUDED.expires_at),
+         EXCLUDED.expires_at
+       ),
+       external_id = EXCLUDED.external_id,
+       updated_at = NOW()
+     WHERE user_entitlements.source <> 'paypal_lifetime'`,
+    [subscription.user_id, expiresAt, subscriptionId]
+  );
+}
+
+/*
+ * PayPal webhooks
+ *
+ * Activation by itself does not grant Premium.
+ * A completed subscription payment is required.
+ */
+
+app.post('/api/v1/paypal/webhook', async (req, res, next) => {
+  let client;
+
+  try {
     const event = req.body;
+
     if (!event || typeof event !== 'object') {
       throw httpError(400, 'Invalid webhook body');
     }
 
-    const headers = req.headers;
-    const verification = await paypalRequest(
-      '/v1/notifications/verify-webhook-signature',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          auth_algo: headers['paypal-auth-algo'],
-          cert_url: headers['paypal-cert-url'],
-          transmission_id: headers['paypal-transmission-id'],
-          transmission_sig: headers['paypal-transmission-sig'],
-          transmission_time: headers['paypal-transmission-time'],
-          webhook_id: process.env.PAYPAL_WEBHOOK_ID,
-          webhook_event: event
-        })
-      }
-    );
-
-    if (verification.verification_status !== 'SUCCESS') {
-      throw httpError(400, 'Invalid webhook signature');
-    }
+    await verifyPayPalWebhook(event, req.headers);
 
     if (!event.id || !event.event_type) {
       throw httpError(400, 'Missing webhook event identity');
     }
 
-    const client = await pool.connect();
+    client = await pool.connect();
+    await client.query('BEGIN');
 
-    try {
-      await client.query('BEGIN');
+    const inserted = await client.query(
+      `INSERT INTO paypal_events (event_id, event_type)
+       VALUES ($1, $2)
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING event_id`,
+      [event.id, event.event_type]
+    );
 
-      const inserted = await client.query(
-        `INSERT INTO paypal_events (event_id, event_type)
-         VALUES ($1, $2)
-         ON CONFLICT (event_id) DO NOTHING
-         RETURNING event_id`,
-        [event.id, event.event_type]
+    if (!inserted.rowCount) {
+      await client.query('COMMIT');
+
+      return res.json({
+        received: true,
+        duplicate: true
+      });
+    }
+
+    const resource = event.resource || {};
+    const subscriptionId = resource.id;
+
+    const subscriptionEvents = {
+      'BILLING.SUBSCRIPTION.ACTIVATED': 'active',
+      'BILLING.SUBSCRIPTION.UPDATED': 'active',
+      'BILLING.SUBSCRIPTION.CANCELLED': 'cancelled',
+      'BILLING.SUBSCRIPTION.EXPIRED': 'expired',
+      'BILLING.SUBSCRIPTION.SUSPENDED': 'suspended'
+    };
+
+    const mappedStatus = subscriptionEvents[event.event_type];
+
+    if (mappedStatus && subscriptionId) {
+      await client.query(
+        `UPDATE paypal_subscriptions
+         SET status = $2, updated_at = NOW()
+         WHERE paypal_subscription_id = $1`,
+        [subscriptionId, mappedStatus]
       );
 
-      // Already processed: return success so PayPal doesn't retry forever.
-      if (!inserted.rowCount) {
-        await client.query('COMMIT');
-        return res.json({ received: true, duplicate: true });
-      }
-
-      const resource = event.resource || {};
-      const subscriptionId = resource.id;
-
-      const subscriptionEvents = {
-        'BILLING.SUBSCRIPTION.ACTIVATED': 'active',
-        'BILLING.SUBSCRIPTION.UPDATED': 'active',
-        'BILLING.SUBSCRIPTION.CANCELLED': 'cancelled',
-        'BILLING.SUBSCRIPTION.EXPIRED': 'expired',
-        'BILLING.SUBSCRIPTION.SUSPENDED': 'suspended'
-      };
-
-      const mappedStatus = subscriptionEvents[event.event_type];
-
-      if (mappedStatus && subscriptionId) {
-        const mapped = await client.query(
-          `UPDATE paypal_subscriptions
-           SET status = $2, updated_at = NOW()
-           WHERE paypal_subscription_id = $1
-           RETURNING user_id`,
-          [subscriptionId, mappedStatus]
+      // Do not grant Premium merely because a subscription was activated.
+      // Cancellation does not automatically remove already-paid access.
+      if (mappedStatus === 'expired') {
+        await client.query(
+          `UPDATE user_entitlements
+           SET active = FALSE, updated_at = NOW()
+           WHERE feature = 'premium'
+             AND source = 'paypal_subscription'
+             AND external_id = $1
+             AND expires_at <= NOW()`,
+          [subscriptionId]
         );
-
-        if (mapped.rowCount) {
-          const userId = mapped.rows[0].user_id;
-
-          if (mappedStatus === 'active') {
-            // Subscription is active, but activation alone does not prove
-            // a successful billing cycle. Payment events should be reconciled.
-            await client.query(
-              `INSERT INTO user_entitlements
-                 (user_id, feature, active, source, external_id, updated_at)
-               VALUES ($1, 'premium', TRUE, 'paypal_subscription', $2, NOW())
-               ON CONFLICT (user_id, feature)
-               DO UPDATE SET active = TRUE,
-                 source = 'paypal_subscription',
-                 external_id = EXCLUDED.external_id,
-                 updated_at = NOW()`,
-              [userId, subscriptionId]
-            );
-          } else {
-            await client.query(
-              `UPDATE user_entitlements
-               SET active = FALSE, updated_at = NOW()
-               WHERE user_id = $1 AND feature = 'premium'
-                 AND source = 'paypal_subscription'
-                 AND external_id = $2`,
-              [userId, subscriptionId]
-            );
-          }
-        }
       }
-
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
     }
+
+    if (event.event_type === 'PAYMENT.SALE.COMPLETED') {
+      await processSubscriptionPayment(client, resource, event.id);
+    }
+
+    if (
+      event.event_type === 'PAYMENT.SALE.REFUNDED' ||
+      event.event_type === 'PAYMENT.SALE.REVERSED'
+    ) {
+      const originalSaleId = resource.sale_id || resource.id;
+
+      await client.query(
+        `UPDATE paypal_payments
+         SET status = $2, updated_at = NOW()
+         WHERE paypal_capture_id = $1
+           AND payment_type = 'subscription'`,
+        [
+          originalSaleId,
+          event.event_type === 'PAYMENT.SALE.REFUNDED'
+            ? 'refunded'
+            : 'reversed'
+        ]
+      );
+
+      // Revoke only the matching subscription entitlement, never Lifetime.
+      const payment = await client.query(
+        `SELECT paypal_subscription_id
+         FROM paypal_payments
+         WHERE paypal_capture_id = $1
+           AND payment_type = 'subscription'`,
+        [originalSaleId]
+      );
+
+      if (payment.rowCount) {
+        const affectedSubscription = payment.rows[0].paypal_subscription_id;
+
+        await client.query(
+          `UPDATE user_entitlements
+           SET active = FALSE, updated_at = NOW()
+           WHERE feature = 'premium'
+             AND source = 'paypal_subscription'
+             AND external_id = $1`,
+          [affectedSubscription]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
 
     res.json({ received: true });
   } catch (error) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+    }
+
     next(error);
+  } finally {
+    client?.release();
   }
 });
+
+/*
+ * Torrent policy
+ */
 
 app.get('/api/v1/torrent/policy', getUser, async (req, res, next) => {
   try {
     const premium = await hasPremium(req.user);
 
-    const maxBytesPerDownload = Number(
+    const configuredLimit = Number(
       premium
         ? process.env.PREMIUM_TORRENT_MAX_BYTES || 104857600
         : process.env.FREE_TORRENT_MAX_BYTES || 10485760
     );
+
+    const maxBytesPerDownload = Number.isSafeInteger(configuredLimit) &&
+      configuredLimit > 0
+      ? configuredLimit
+      : premium ? 104857600 : 10485760;
 
     res.json({
       premium,
@@ -745,17 +1153,27 @@ app.get('/api/v1/torrent/policy', getUser, async (req, res, next) => {
   }
 });
 
+/*
+ * Error handling
+ */
+
 app.use((error, _req, res, _next) => {
   const status = Number(error.status) || 500;
 
   if (status >= 500) {
-    console.error(error.message);
+    console.error('Backend error:', error.message);
   }
 
   res.status(status).json({
-    error: status >= 500 ? 'Internal server error' : error.message
+    error: status >= 500
+      ? 'Internal server error'
+      : error.message
   });
 });
+
+/*
+ * Server shutdown
+ */
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TAY'S STUDIO backend listening on ${PORT}`);
@@ -763,8 +1181,11 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 async function shutdown() {
   server.close(async () => {
-    await pool.end();
-    process.exit(0);
+    try {
+      await pool.end();
+    } finally {
+      process.exit(0);
+    }
   });
 }
 
