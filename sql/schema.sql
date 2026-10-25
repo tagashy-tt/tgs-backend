@@ -80,10 +80,10 @@ CREATE TABLE IF NOT EXISTS public.paypal_events (
 
 COMMIT;
 
-Important security notes
-
-- "password_hash" must contain a strong password hash produced by the backend, for example Argon2id. Never store plaintext passwords.
-- Generate session tokens with a cryptographically secure random generator and store only their SHA-256 hash in "token_hash".
-- Configure "OWNER_EMAIL" as a private Railway variable. Owner privileges must be assigned by the server, never by the APK or public registration.
-- Verify PayPal webhook signatures before processing events or granting Premium.
-- Back up the database before applying schema changes. This script creates the new tables; it does not migrate existing Supabase users or subscriptions.
+-- Important security notes
+-- 
+-- - "password_hash" must contain a strong password hash produced by the backend, for example Argon2id. Never store plaintext passwords.
+-- - Generate session tokens with a cryptographically secure random generator and store only their SHA-256 hash in "token_hash".
+-- - Configure "OWNER_EMAIL" as a private Railway variable. Owner privileges must be assigned by the server, never by the APK or public registration.
+-- - Verify PayPal webhook signatures before processing events or granting Premium.
+-- - Back up the database before applying schema changes. This script creates the new tables; it does not migrate existing Supabase users or subscriptions.
