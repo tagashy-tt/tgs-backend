@@ -64,3 +64,16 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 - `GET /api/v1/me/entitlements` returns `role`, `plan`, `expiresAt`, and `daysRemaining` for customer accounts. `daysRemaining: null` means lifetime access or owner access; a value of `0` means no active subscription.
 - The UI should display e.g. “Premium · quedan 12 días”, “Premium de por vida” or “Propietario · acceso completo”.
 - Important: subscription webhook-to-user mapping and lifecycle event handling still need completion and tests before production. Do not enable live payments yet.
+
+
+## Diagnostics (v0.3.1)
+
+- `GET /api/v1/admin/paypal-check` (owner only, Bearer token): reports whether the
+  PayPal credentials work and whether `PAYPAL_PLAN_MONTHLY_ID` / `PAYPAL_PLAN_YEARLY_ID`
+  exist and are ACTIVE in the configured `PAYPAL_MODE`. No secrets are returned.
+- Subscription errors now return a `code` (`plan_not_configured`, `plan_not_found`,
+  `plan_inactive`, `paypal_not_authorized`, `paypal_credentials`, `paypal_unreachable`).
+  `plan_not_found` almost always means the plan ID belongs to the other mode
+  (sandbox vs live).
+- Owner: recognised from `OWNER_EMAIL` without needing `email_verified_at`.
+- Weekly limits: `GET /api/v1/me/usage`, `POST /api/v1/usage/consume|refund`.
