@@ -19,7 +19,7 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
-const paypalBase = process.env.PAYPAL_MODE === 'live'
+const paypalBase = String(process.env.PAYPAL_MODE || '').trim().toLowerCase() === 'live'
   ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
 
@@ -79,21 +79,36 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function isOwner(user) {
-  const ownerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+// Railway variables are often pasted with stray spaces, quotes or newlines.
+function env(name) {
+  return String(process.env[name] ?? '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
 
-  return Boolean(
-    ownerEmail &&
-    user &&
-    normalizeEmail(user.email) === ownerEmail &&
-    user.email_verified_at
-  );
+/*
+ * Owner is assigned only by the server, from the private OWNER_EMAIL variable.
+ * Email verification is not implemented yet, so requiring email_verified_at
+ * made it impossible for the owner to ever be recognised. Set
+ * OWNER_REQUIRE_VERIFIED=true once verification exists to restore that check.
+ */
+function isOwner(user) {
+  const ownerEmail = normalizeEmail(env('OWNER_EMAIL'));
+
+  if (!ownerEmail || !user) return false;
+  if (normalizeEmail(user.email) !== ownerEmail) return false;
+
+  return env('OWNER_REQUIRE_VERIFIED') === 'true'
+    ? Boolean(user.email_verified_at)
+    : true;
 }
 
 function safeUser(row) {
   return {
     id: row.id,
     email: row.email,
+    role: isOwner(row) ? 'owner' : 'customer',
     emailVerified: Boolean(row.email_verified_at),
     createdAt: row.created_at
   };
@@ -134,19 +149,24 @@ function configuredLifetimePrice() {
   return Number(price).toFixed(2);
 }
 
+function planPrice(name, fallback) {
+  const value = env(name);
+  return validMoney(value) ? Number(value).toFixed(2) : fallback;
+}
+
 function configuredSubscriptionPlan(plan) {
   if (plan === 'monthly') {
     return {
-      id: process.env.PAYPAL_PLAN_MONTHLY_ID,
-      price: '2.99',
+      id: env('PAYPAL_PLAN_MONTHLY_ID'),
+      price: planPrice('PAYPAL_PLAN_MONTHLY_PRICE_USD', '2.99'),
       intervalDays: 31
     };
   }
 
   if (plan === 'yearly') {
     return {
-      id: process.env.PAYPAL_PLAN_YEARLY_ID,
-      price: '29.99',
+      id: env('PAYPAL_PLAN_YEARLY_ID'),
+      price: planPrice('PAYPAL_PLAN_YEARLY_PRICE_USD', '29.99'),
       intervalDays: 366
     };
   }
@@ -228,15 +248,12 @@ async function createSession(user, req) {
 }
 
 async function paypalAccessToken() {
-  if (
-    !process.env.PAYPAL_CLIENT_ID ||
-    !process.env.PAYPAL_CLIENT_SECRET
-  ) {
+  if (!env('PAYPAL_CLIENT_ID') || !env('PAYPAL_CLIENT_SECRET')) {
     throw httpError(503, 'PayPal is not configured');
   }
 
   const credentials = Buffer.from(
-    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
+    `${env('PAYPAL_CLIENT_ID')}:${env('PAYPAL_CLIENT_SECRET')}`
   ).toString('base64');
 
   const response = await fetch(`${paypalBase}/v1/oauth2/token`, {
@@ -247,16 +264,46 @@ async function paypalAccessToken() {
     },
     body: 'grant_type=client_credentials',
     signal: AbortSignal.timeout(15000)
+  }).catch(error => {
+    console.error('PayPal network error:', error?.name || 'error');
+    throw Object.assign(httpError(502, 'PayPal is unreachable'), {
+      code: 'paypal_unreachable'
+    });
   });
 
   const body = await response.json().catch(() => ({}));
 
   if (!response.ok || !body.access_token) {
     console.error('PayPal OAuth failed:', response.status);
-    throw httpError(502, 'Could not authenticate with PayPal');
+    throw Object.assign(
+      httpError(502, 'Could not authenticate with PayPal'),
+      { code: 'paypal_credentials' } // wrong client id/secret or wrong mode
+    );
   }
 
   return body.access_token;
+}
+
+function paypalErrorCode(status, name, issue) {
+  const text = `${name || ''} ${issue || ''}`.toUpperCase();
+
+  if (status === 404 || text.includes('RESOURCE_NOT_FOUND')) {
+    return 'plan_not_found'; // wrong plan id, or sandbox/live mismatch
+  }
+
+  if (text.includes('PLAN_NOT_ACTIVE') || text.includes('INACTIVE')) {
+    return 'plan_inactive';
+  }
+
+  if (status === 401 || status === 403 || text.includes('NOT_AUTHORIZED')) {
+    return 'paypal_not_authorized'; // Subscriptions not enabled on the app
+  }
+
+  if (status === 422 || status === 400) {
+    return 'paypal_rejected';
+  }
+
+  return 'paypal_error';
 }
 
 async function paypalRequest(path, options = {}) {
@@ -270,6 +317,11 @@ async function paypalRequest(path, options = {}) {
       ...(options.headers || {})
     },
     signal: AbortSignal.timeout(20000)
+  }).catch(error => {
+    console.error('PayPal network error:', error?.name || 'error');
+    throw Object.assign(httpError(502, 'PayPal is unreachable'), {
+      code: 'paypal_unreachable'
+    });
   });
 
   const body = response.status === 204
@@ -277,8 +329,28 @@ async function paypalRequest(path, options = {}) {
     : await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    console.error('PayPal API error:', response.status);
-    throw httpError(502, 'PayPal request failed');
+    // Log PayPal's own error name/issue (never credentials) so the cause
+    // shows up in Railway logs instead of a bare "502".
+    const issue = body?.details?.[0]?.issue || null;
+
+    console.error(
+      'PayPal API error:',
+      response.status,
+      path.split('?')[0].replace(/\/[A-Z0-9-]{10,}/gi, '/:id'),
+      body?.name || '',
+      issue || '',
+      body?.debug_id ? `debug_id=${body.debug_id}` : ''
+    );
+
+    throw Object.assign(httpError(502, 'PayPal request failed'), {
+      code: paypalErrorCode(response.status, body?.name, issue),
+      paypal: {
+        status: response.status,
+        name: body?.name || null,
+        issue,
+        debugId: body?.debug_id || null
+      }
+    });
   }
 
   return body;
@@ -335,7 +407,7 @@ app.get('/health', async (_req, res) => {
     res.json({
       ok: true,
       service: 'tay-studio-backend',
-      version: '0.3.0',
+      version: '0.3.1',
       database: 'connected'
     });
   } catch {
@@ -359,13 +431,13 @@ app.get('/api/v1/plans', (_req, res) => {
         id: 'monthly',
         type: 'subscription',
         label: 'Premium Monthly',
-        configured: Boolean(process.env.PAYPAL_PLAN_MONTHLY_ID)
+        configured: Boolean(env('PAYPAL_PLAN_MONTHLY_ID'))
       },
       {
         id: 'yearly',
         type: 'subscription',
         label: 'Premium Yearly',
-        configured: Boolean(process.env.PAYPAL_PLAN_YEARLY_ID)
+        configured: Boolean(env('PAYPAL_PLAN_YEARLY_ID'))
       },
       {
         id: 'lifetime',
@@ -563,14 +635,29 @@ app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
     const plan = String(req.body?.plan || '');
     const configuredPlan = configuredSubscriptionPlan(plan);
 
-    if (!configuredPlan?.id) {
-      throw httpError(400, 'Plan is not configured');
+    if (!configuredPlan) {
+      throw httpError(400, 'Unknown plan');
+    }
+
+    if (!configuredPlan.id) {
+      throw Object.assign(
+        httpError(503, 'Plan is not configured on the server'),
+        { code: 'plan_not_configured' }
+      );
+    }
+
+    if (!/^https?:\/\//i.test(env('APP_BASE_URL'))) {
+      throw Object.assign(
+        httpError(503, 'APP_BASE_URL is not configured'),
+        { code: 'app_base_url_missing' }
+      );
     }
 
     const result = await paypalRequest('/v1/billing/subscriptions', {
       method: 'POST',
       headers: {
-        'PayPal-Request-Id': crypto.randomUUID()
+        'PayPal-Request-Id': crypto.randomUUID(),
+        Prefer: 'return=representation'
       },
       body: JSON.stringify({
         plan_id: configuredPlan.id,
@@ -578,8 +665,8 @@ app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
         application_context: {
           brand_name: "TAY'S STUDIO",
           user_action: 'SUBSCRIBE_NOW',
-          return_url: `${process.env.APP_BASE_URL}/payment/success`,
-          cancel_url: `${process.env.APP_BASE_URL}/payment/cancel`
+          return_url: `${env('APP_BASE_URL').replace(/\/+$/, '')}/payment/success`,
+          cancel_url: `${env('APP_BASE_URL').replace(/\/+$/, '')}/payment/cancel`
         }
       })
     });
@@ -636,8 +723,8 @@ app.post('/api/v1/paypal/lifetime/order', getUser, async (req, res, next) => {
         application_context: {
           brand_name: "TAY'S STUDIO",
           user_action: 'PAY_NOW',
-          return_url: `${process.env.APP_BASE_URL}/payment/success`,
-          cancel_url: `${process.env.APP_BASE_URL}/payment/cancel`
+          return_url: `${env('APP_BASE_URL').replace(/\/+$/, '')}/payment/success`,
+          cancel_url: `${env('APP_BASE_URL').replace(/\/+$/, '')}/payment/cancel`
         }
       })
     });
@@ -1124,6 +1211,243 @@ app.post('/api/v1/paypal/webhook', async (req, res, next) => {
 });
 
 /*
+ * Weekly usage limits (server-side, so they survive reinstalling the APK)
+ *
+ * Free users: topaz 10 / check 5 / download 5 per week. Premium and owner are
+ * unlimited. The week starts on Monday 00:00 in USAGE_TZ.
+ * Flow: the app calls /usage/consume BEFORE the job and /usage/refund if the
+ * job fails, so a failed job never costs a use.
+ */
+
+const USAGE_FEATURES = {
+  topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 10 },
+  check: { env: 'FREE_WEEKLY_CHECK', fallback: 5 },
+  download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 5 }
+};
+
+function usageTimezone() {
+  return env('USAGE_TZ') || 'America/Costa_Rica';
+}
+
+function usageLimit(feature) {
+  const cfg = USAGE_FEATURES[feature];
+  const raw = env(cfg.env);
+  const n = raw === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : cfg.fallback;
+}
+
+let usageSchemaReady = null;
+
+function ensureUsageSchema() {
+  usageSchemaReady ??= pool.query(
+    `CREATE TABLE IF NOT EXISTS public.usage_counters (
+       user_id UUID NOT NULL REFERENCES public.app_users(id)
+         ON DELETE CASCADE,
+       feature TEXT NOT NULL,
+       week_start DATE NOT NULL,
+       count INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (user_id, feature, week_start)
+     )`
+  ).catch(error => {
+    usageSchemaReady = null;
+    throw error;
+  });
+
+  return usageSchemaReady;
+}
+
+async function currentWeek() {
+  const r = await pool.query(
+    `SELECT to_char(date_trunc('week', NOW() AT TIME ZONE $1), 'YYYY-MM-DD') AS week_start,
+            ((date_trunc('week', NOW() AT TIME ZONE $1)
+              + INTERVAL '7 days') AT TIME ZONE $1) AS resets_at`,
+    [usageTimezone()]
+  );
+
+  return r.rows[0];
+}
+
+async function usageSnapshot(user) {
+  await ensureUsageSchema();
+
+  const unlimited = await hasPremium(user);
+  const week = await currentWeek();
+
+  const rows = await pool.query(
+    `SELECT feature, count FROM usage_counters
+     WHERE user_id = $1 AND week_start = $2`,
+    [user.id, week.week_start]
+  );
+
+  const used = Object.fromEntries(rows.rows.map(r => [r.feature, r.count]));
+
+  const features = {};
+
+  for (const feature of Object.keys(USAGE_FEATURES)) {
+    const limit = usageLimit(feature);
+    const n = used[feature] || 0;
+
+    features[feature] = unlimited
+      ? { limit: null, used: n, remaining: null }
+      : { limit, used: n, remaining: Math.max(0, limit - n) };
+  }
+
+  return {
+    unlimited,
+    weekStart: week.week_start,
+    resetsAt: week.resets_at,
+    timezone: usageTimezone(),
+    features
+  };
+}
+
+app.get('/api/v1/me/usage', getUser, async (req, res, next) => {
+  try {
+    res.json(await usageSnapshot(req.user));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/v1/usage/consume', getUser, async (req, res, next) => {
+  try {
+    const feature = String(req.body?.feature || '');
+
+    if (!USAGE_FEATURES[feature]) {
+      throw httpError(400, 'Unknown feature');
+    }
+
+    await ensureUsageSchema();
+
+    if (await hasPremium(req.user)) {
+      return res.json({ ok: true, ...(await usageSnapshot(req.user)) });
+    }
+
+    const week = await currentWeek();
+    const limit = usageLimit(feature);
+
+    // Atomic: the row is only incremented while it is below the limit.
+    const result = await pool.query(
+      `INSERT INTO usage_counters (user_id, feature, week_start, count)
+       SELECT $1, $2, $3, 1 WHERE $4 > 0
+       ON CONFLICT (user_id, feature, week_start)
+       DO UPDATE SET count = usage_counters.count + 1, updated_at = NOW()
+       WHERE usage_counters.count < $4
+       RETURNING count`,
+      [req.user.id, feature, week.week_start, limit]
+    );
+
+    if (!result.rowCount) {
+      const snapshot = await usageSnapshot(req.user);
+
+      return res.status(429).json({
+        error: 'Weekly free limit reached',
+        code: 'limit_reached',
+        ...snapshot
+      });
+    }
+
+    res.json({ ok: true, ...(await usageSnapshot(req.user)) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/v1/usage/refund', getUser, async (req, res, next) => {
+  try {
+    const feature = String(req.body?.feature || '');
+
+    if (!USAGE_FEATURES[feature]) {
+      throw httpError(400, 'Unknown feature');
+    }
+
+    await ensureUsageSchema();
+
+    const week = await currentWeek();
+
+    await pool.query(
+      `UPDATE usage_counters
+       SET count = GREATEST(0, count - 1), updated_at = NOW()
+       WHERE user_id = $1 AND feature = $2 AND week_start = $3`,
+      [req.user.id, feature, week.week_start]
+    );
+
+    res.json({ ok: true, ...(await usageSnapshot(req.user)) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
+ * Owner-only PayPal configuration check. Returns no secrets: it reports
+ * whether the credentials work and whether each plan id exists and is ACTIVE
+ * in the configured PAYPAL_MODE.
+ */
+
+app.get('/api/v1/admin/paypal-check', getUser, async (req, res, next) => {
+  try {
+    if (!isOwner(req.user)) throw httpError(403, 'Owner only');
+
+    const out = {
+      mode: String(env('PAYPAL_MODE')).toLowerCase() === 'live' ? 'live' : 'sandbox',
+      appBaseUrlOk: /^https?:\/\//i.test(env('APP_BASE_URL')),
+      lifetimePriceOk: validMoney(env('PAYPAL_LIFETIME_PRICE_USD')),
+      webhookIdSet: Boolean(env('PAYPAL_WEBHOOK_ID')),
+      credentials: false,
+      plans: {}
+    };
+
+    try {
+      await paypalAccessToken();
+      out.credentials = true;
+    } catch {
+      return res.json(out);
+    }
+
+    for (const name of ['monthly', 'yearly']) {
+      const plan = configuredSubscriptionPlan(name);
+
+      if (!plan.id) {
+        out.plans[name] = { configured: false };
+        continue;
+      }
+
+      try {
+        const remote = await paypalRequest(
+          `/v1/billing/plans/${encodeURIComponent(plan.id)}`,
+          { method: 'GET' }
+        );
+
+        const price = remote.billing_cycles
+          ?.find(c => c.tenure_type === 'REGULAR')
+          ?.pricing_scheme?.fixed_price?.value;
+
+        out.plans[name] = {
+          configured: true,
+          found: true,
+          status: remote.status,
+          price: price ?? null,
+          expectedPrice: plan.price,
+          priceMatches: price === undefined ? null : price === plan.price
+        };
+      } catch (error) {
+        out.plans[name] = {
+          configured: true,
+          found: false,
+          code: error.code || 'paypal_error',
+          paypal: error.paypal || null
+        };
+      }
+    }
+
+    res.json(out);
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
  * Torrent policy
  */
 
@@ -1164,11 +1488,17 @@ app.use((error, _req, res, _next) => {
     console.error('Backend error:', error.message);
   }
 
-  res.status(status).json({
-    error: status >= 500
+  const body = {
+    error: status >= 500 && !error.code
       ? 'Internal server error'
       : error.message
-  });
+  };
+
+  // Safe, non-secret diagnostics so the app can show a useful message.
+  if (error.code) body.code = error.code;
+  if (error.paypal) body.paypal = error.paypal;
+
+  res.status(status).json(body);
 });
 
 /*
