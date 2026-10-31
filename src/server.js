@@ -697,12 +697,47 @@ app.post('/api/v1/paypal/subscription', getUser, async (req, res, next) => {
 });
 
 /*
+ * Lifetime promo code. Checked only here (never in the app).
+ *   LIFETIME_PROMO_CODE     default TAY'S-LAUNCH31 (case, spaces, hyphens and apostrophes are ignored)
+ *   LIFETIME_PROMO_PRICE_USD exact price with the code (e.g. 19.99); wins over the percent
+ *   LIFETIME_PROMO_PERCENT  discount in percent, 1-90 (default 20)
+ *   LIFETIME_PROMO_ENABLED  set to false (or 0 / off / no) to switch the code off; unset or anything else = on
+ *   LIFETIME_PROMO_UNTIL    optional ISO date; after it the code stops working
+ */
+const promoKey = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function lifetimePromo(code, { ignoreSwitch = false } = {}) {
+  if (!ignoreSwitch && ['false', '0', 'off', 'no'].includes(String(process.env.LIFETIME_PROMO_ENABLED || '').trim().toLowerCase())) return null;
+  const configured = process.env.LIFETIME_PROMO_CODE || "TAY'S-LAUNCH31";
+  if (!code || promoKey(code) !== promoKey(configured)) return null;
+  const until = process.env.LIFETIME_PROMO_UNTIL;
+  if (!ignoreSwitch && until && !(Date.now() <= Date.parse(until))) return null;
+  const pct = Math.min(90, Math.max(1, Number(process.env.LIFETIME_PROMO_PERCENT) || 20));
+  const full = Number(configuredLifetimePrice());
+  const fixed = process.env.LIFETIME_PROMO_PRICE_USD;
+  if (validMoney(fixed) && Number(fixed) < full) {
+    return { percent: Math.round((1 - Number(fixed) / full) * 100), price: Number(fixed).toFixed(2), full: full.toFixed(2) };
+  }
+  return { percent: pct, price: (Math.round(full * (100 - pct)) / 100).toFixed(2), full: full.toFixed(2) };
+}
+
+app.post('/api/v1/promo/lifetime', getUser, (req, res, next) => {
+  try {
+    const promo = lifetimePromo(req.body?.code);
+    res.json(promo ? { valid: true, ...promo } : { valid: false });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
  * PayPal Lifetime order creation
  */
 
 app.post('/api/v1/paypal/lifetime/order', getUser, async (req, res, next) => {
   try {
-    const price = configuredLifetimePrice();
+    const promo = req.body?.promo ? lifetimePromo(req.body.promo) : null;
+    if (req.body?.promo && !promo) throw httpError(400, 'Invalid promo code');
+    const price = promo ? promo.price : configuredLifetimePrice();
 
     const order = await paypalRequest('/v2/checkout/orders', {
       method: 'POST',
@@ -765,7 +800,8 @@ app.post('/api/v1/paypal/lifetime/capture', getUser, async (req, res, next) => {
       throw httpError(400, 'Invalid orderId');
     }
 
-    const price = configuredLifetimePrice();
+    const fullPrice = configuredLifetimePrice();
+    const promoPrice = lifetimePromo(process.env.LIFETIME_PROMO_CODE || "TAY'S-LAUNCH31", { ignoreSwitch: true })?.price;
 
     // Read the order first, so retries do not blindly recapture it.
     let order = await paypalRequest(
@@ -799,7 +835,7 @@ app.post('/api/v1/paypal/lifetime/capture', getUser, async (req, res, next) => {
       String(unit?.custom_id || '') !== String(req.user.id) ||
       unit?.reference_id !== 'tay-studio-lifetime' ||
       capture?.amount?.currency_code !== 'USD' ||
-      capture?.amount?.value !== price ||
+      ![fullPrice, promoPrice].includes(capture?.amount?.value) ||
       !capture?.id
     ) {
       throw httpError(409, 'Payment not verified');
@@ -818,7 +854,7 @@ app.post('/api/v1/paypal/lifetime/capture', getUser, async (req, res, next) => {
       [
         capture.id,
         req.user.id,
-        price,
+        capture.amount.value,
         `capture:${capture.id}`
       ]
     );
@@ -1301,6 +1337,30 @@ async function usageSnapshot(user) {
     features
   };
 }
+
+
+// ---------------------------------------------------------------------------------------------------------
+// App integrity. The app sends the SHA-256 of the certificate it is signed with and its package name. A copy of the app
+// that was rebuilt / re-signed by somebody else reports a different certificate. The answer decides whether the app locks itself.
+//   APP_CERT_SHA256   comma-separated list of allowed certificate fingerprints (hex, with or without colons). Empty = nothing is checked.
+//   APP_PACKAGE       allowed package name (default com.tgs.uploader)
+//   INTEGRITY_ENFORCE 'true' turns the lock on. Anything else only logs mismatches (use it first to confirm your own builds pass).
+// Fails open: no answer from the server never locks the app. This raises the cost of re-publishing the app; it cannot make copying impossible.
+// ---------------------------------------------------------------------------------------------------------
+const normHex = (v) => String(v || '').replace(/[^0-9a-f]/gi, '').toLowerCase();
+app.post('/api/v1/integrity', (req, res) => {
+  const allowedCerts = String(process.env.APP_CERT_SHA256 || '').split(',').map(normHex).filter(Boolean);
+  const allowedPkg = String(process.env.APP_PACKAGE || 'com.tgs.uploader').trim();
+  const cert = normHex(req.body && req.body.cert);
+  const pkg = String((req.body && req.body.pkg) || '').slice(0, 120);
+  const certBad = allowedCerts.length > 0 && cert !== '' && !allowedCerts.includes(cert);
+  const pkgBad = pkg !== '' && pkg !== allowedPkg;
+  const mismatch = certBad || pkgBad;
+  if (mismatch) {
+    console.warn('[integrity] mismatch', { cert: cert.slice(0, 16), pkg, version: String((req.body && req.body.version) || '').slice(0, 20) });
+  }
+  res.json({ ok: !mismatch, lock: mismatch && process.env.INTEGRITY_ENFORCE === 'true' });
+});
 
 app.get('/api/v1/me/usage', getUser, async (req, res, next) => {
   try {
