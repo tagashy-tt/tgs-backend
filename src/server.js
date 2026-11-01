@@ -174,6 +174,59 @@ function configuredSubscriptionPlan(plan) {
   return null;
 }
 
+/*
+ * Beta-tester gift: BETA_PREMIUM_EMAILS = emails separated by comma, space or new line.
+ * The first time one of them signs in (or already has a session) and has NO premium row yet,
+ * they receive BETA_PREMIUM_DAYS days (default 365) of Premium, once. Paid, lifetime or
+ * previously gifted rows are never touched. The email is not verified yet, so only use
+ * addresses you trust (or set BETA_PREMIUM_REQUIRE_VERIFIED=true once verification exists).
+ */
+const betaGiftDone = new Set();
+
+function betaGiftEmails() {
+  return new Set(
+    env('BETA_PREMIUM_EMAILS')
+      .split(/[\s,;]+/)
+      .map(normalizeEmail)
+      .filter(Boolean)
+  );
+}
+
+async function grantBetaGift(user) {
+  try {
+    if (!user || betaGiftDone.has(user.id)) return;
+
+    const emails = betaGiftEmails();
+    if (!emails.size || !emails.has(normalizeEmail(user.email))) return;
+
+    if (env('BETA_PREMIUM_REQUIRE_VERIFIED') === 'true' && !user.email_verified_at) return;
+
+    const days = Math.min(
+      3650,
+      Math.max(1, Math.floor(Number(env('BETA_PREMIUM_DAYS')) || 365))
+    );
+
+    const existing = await pool.query(
+      `SELECT 1 FROM user_entitlements
+       WHERE user_id = $1 AND feature = 'premium'
+       LIMIT 1`,
+      [user.id]
+    );
+
+    if (existing.rowCount === 0) {
+      await setEntitlement(user.id, 'premium', true, {
+        source: 'beta_gift',
+        expires_at: new Date(Date.now() + days * 86400000).toISOString()
+      });
+      console.log(`[beta-gift] ${days} days of Premium granted to ${user.email}`);
+    }
+
+    betaGiftDone.add(user.id);
+  } catch (error) {
+    console.error('[beta-gift] failed:', error.message);
+  }
+}
+
 async function getUser(req, _res, next) {
   try {
     requireConfig();
@@ -207,6 +260,7 @@ async function getUser(req, _res, next) {
     }
 
     req.user = result.rows[0];
+    await grantBetaGift(req.user);
 
     await pool.query(
       `UPDATE app_sessions
@@ -1249,14 +1303,14 @@ app.post('/api/v1/paypal/webhook', async (req, res, next) => {
 /*
  * Weekly usage limits (server-side, so they survive reinstalling the APK)
  *
- * Free users: topaz 10 / check 5 / download 5 per week. Premium and owner are
+ * Free users: topaz 5 / check 5 / download 5 per week. Premium and owner are
  * unlimited. The week starts on Monday 00:00 in USAGE_TZ.
  * Flow: the app calls /usage/consume BEFORE the job and /usage/refund if the
  * job fails, so a failed job never costs a use.
  */
 
 const USAGE_FEATURES = {
-  topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 10 },
+  topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 5 },
   check: { env: 'FREE_WEEKLY_CHECK', fallback: 5 },
   download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 5 }
 };
