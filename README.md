@@ -77,3 +77,16 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
   (sandbox vs live).
 - Owner: recognised from `OWNER_EMAIL` without needing `email_verified_at`.
 - Weekly limits: `GET /api/v1/me/usage`, `POST /api/v1/usage/consume|refund`.
+
+
+## 0.4.0 — trial, anti-abuse, AI subtitles
+- **7-day trial per device.** The app calls `POST /api/v1/device/hello` on first launch (this starts the clock) and sends `X-Device-Id` on every request.
+  When an account signs in on that device it receives a normal `premium` row with `source = 'trial'` ending on the device's date.
+  The entitlements answer reports `plan: "trial"` and a `trial` object `{active, endsAt, daysRemaining}`.
+- **Rules:** one trial per device (a 2nd account shares the same end date, a 3rd gets none), at most `TRIAL_MAX_DEVICES_PER_IP` new devices per IP per day,
+  banned devices / tampered builds (`INTEGRITY_ENFORCE=true`) / emulators (`TRIAL_BLOCK_EMULATORS=true`) get no trial. Paid, gifted and lifetime rows are never touched.
+- **Anti-abuse:** per-IP rate limits (API, register, login, hello, subtitles), `abuse_events` log, `GET /api/v1/admin/abuse` and `POST /api/v1/admin/device/ban` (owner only).
+  The tables (`device_trials`, `device_accounts`, `abuse_events`, `subtitle_jobs`) are created on first use; no SQL to run.
+- **AI subtitles:** `POST /api/v1/subtitles?seconds=N&lang=es` with the audio bytes as body (Premium or active trial). Needs `STT_API_KEY`.
+- **Tests:** `npm test` needs a PostgreSQL (`TEST_DATABASE_URL`); it wipes that database.
+- Set `TRUST_PROXY=true` and `DEVICE_PEPPER` on Railway.
