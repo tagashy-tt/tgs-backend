@@ -4,6 +4,11 @@ import cors from 'cors';
 import pg from 'pg';
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
+import { rateLimit, cleanDeviceId, cleanFlags } from './antiabuse.js';
+import { createTrialService } from './trial.js';
+import { transcribe, sttConfig, toSrt } from './subtitles.js';
+
+const VERSION = '0.4.0';
 
 const { Pool } = pg;
 const app = express();
@@ -60,6 +65,24 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '256kb' }));
+
+// Anti-abuse rate limits (per IP, in memory). On Railway set TRUST_PROXY=true so req.ip is the real client address.
+app.use('/api/', rateLimit({ name: 'api', windowMs: 10 * 60 * 1000, max: 900 }));
+const registerLimit = rateLimit({ name: 'register', windowMs: 60 * 60 * 1000, max: 8 });
+const loginLimit = rateLimit({ name: 'login', windowMs: 15 * 60 * 1000, max: 40 });
+const helloLimit = rateLimit({ name: 'hello', windowMs: 60 * 60 * 1000, max: 40 });
+
+const trial = createTrialService({ pool, setEntitlement: (...a) => setEntitlement(...a) });
+const deviceIdOf = (req) => cleanDeviceId(req.headers['x-device-id'] || req.body?.deviceId);
+
+/** Never blocks a request: a failure in the trial logic is logged and the request goes on. */
+async function trialHook(req, user) {
+  try {
+    await trial.onAuthed({ user, deviceId: deviceIdOf(req), ip: req.ip, version: String(req.headers['x-app-version'] || '') });
+  } catch (error) {
+    console.error('[trial] failed:', error.message);
+  }
+}
 
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -182,6 +205,7 @@ function configuredSubscriptionPlan(plan) {
  * addresses you trust (or set BETA_PREMIUM_REQUIRE_VERIFIED=true once verification exists).
  */
 const betaGiftDone = new Set();
+const betaGiftWarned = new Set();
 
 function betaGiftEmails() {
   return new Set(
@@ -197,9 +221,25 @@ async function grantBetaGift(user) {
     if (!user || betaGiftDone.has(user.id)) return;
 
     const emails = betaGiftEmails();
-    if (!emails.size || !emails.has(normalizeEmail(user.email))) return;
+    if (!emails.size) {
+      if (!betaGiftWarned.has('empty')) {
+        betaGiftWarned.add('empty');
+        console.log('[beta-gift] BETA_PREMIUM_EMAILS is empty or not set (check the variable name)');
+      }
+      return;
+    }
+    if (!emails.has(normalizeEmail(user.email))) {
+      if (!betaGiftWarned.has(user.id)) {
+        betaGiftWarned.add(user.id);
+        console.log(`[beta-gift] ${user.email} is not in the list (${emails.size} emails loaded)`);
+      }
+      return;
+    }
 
-    if (env('BETA_PREMIUM_REQUIRE_VERIFIED') === 'true' && !user.email_verified_at) return;
+    if (env('BETA_PREMIUM_REQUIRE_VERIFIED') === 'true' && !user.email_verified_at) {
+      console.log(`[beta-gift] ${user.email} skipped: email not verified`);
+      return;
+    }
 
     const days = Math.min(
       3650,
@@ -212,6 +252,10 @@ async function grantBetaGift(user) {
        LIMIT 1`,
       [user.id]
     );
+
+    if (existing.rowCount > 0) {
+      console.log(`[beta-gift] ${user.email} already has a premium row, nothing granted (delete it in user_entitlements to gift)`);
+    }
 
     if (existing.rowCount === 0) {
       await setEntitlement(user.id, 'premium', true, {
@@ -261,6 +305,7 @@ async function getUser(req, _res, next) {
 
     req.user = result.rows[0];
     await grantBetaGift(req.user);
+    await trialHook(req, req.user);
 
     await pool.query(
       `UPDATE app_sessions
@@ -461,7 +506,7 @@ app.get('/health', async (_req, res) => {
     res.json({
       ok: true,
       service: 'tay-studio-backend',
-      version: '0.3.1',
+      version: VERSION,
       database: 'connected'
     });
   } catch {
@@ -509,7 +554,7 @@ app.get('/api/v1/plans', (_req, res) => {
  * Authentication
  */
 
-app.post('/api/v1/auth/register', async (req, res, next) => {
+app.post('/api/v1/auth/register', registerLimit, async (req, res, next) => {
   try {
     requireConfig();
 
@@ -550,7 +595,7 @@ app.post('/api/v1/auth/register', async (req, res, next) => {
   }
 });
 
-app.post('/api/v1/auth/login', async (req, res, next) => {
+app.post('/api/v1/auth/login', loginLimit, async (req, res, next) => {
   try {
     requireConfig();
 
@@ -580,6 +625,7 @@ app.post('/api/v1/auth/login', async (req, res, next) => {
     }
 
     const session = await createSession(user, req);
+    await trialHook(req, user);
 
     res.json({
       user: safeUser(user),
@@ -653,17 +699,31 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
           ? 'free'
           : premiumRow.accessType === 'lifetime'
             ? 'lifetime'
-            : 'subscription',
+            : premiumRow.source === 'trial'
+              ? 'trial'
+              : 'subscription',
       daysRemaining: owner || premiumRow?.accessType === 'lifetime'
         ? null
         : (premiumRow?.daysRemaining ?? 0),
       expiresAt: owner ? null : (premiumRow?.expires_at ?? null),
+      trial: await (async () => {
+        const id = deviceIdOf(req);
+        if (!id) return null;
+        try {
+          await trial.ensureSchema();
+          const d = await trial.getDevice(trial.hashDevice(id));
+          return { ...trial.publicTrial(d), usedByThisAccount: premiumRow?.source === 'trial' };
+        } catch { return null; }
+      })(),
       features: {
         processing_methods: true,
         uploads: true,
         anime_in_app: premium,
         torrent_downloader: premium,
-        premium_tools: premium
+        premium_tools: premium,
+        ai_subtitles: premium,
+        dead_frame_remover: true,
+        cc_lab: true
       },
       entitlements: owner
         ? [{
@@ -1312,7 +1372,8 @@ app.post('/api/v1/paypal/webhook', async (req, res, next) => {
 const USAGE_FEATURES = {
   topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 5 },
   check: { env: 'FREE_WEEKLY_CHECK', fallback: 5 },
-  download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 5 }
+  download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 5 },
+  deadframes: { env: 'FREE_WEEKLY_DEADFRAMES', fallback: 5 }
 };
 
 function usageTimezone() {
@@ -1413,7 +1474,115 @@ app.post('/api/v1/integrity', (req, res) => {
   if (mismatch) {
     console.warn('[integrity] mismatch', { cert: cert.slice(0, 16), pkg, version: String((req.body && req.body.version) || '').slice(0, 20) });
   }
+  const did = cleanDeviceId(req.headers['x-device-id'] || (req.body && req.body.deviceId));
+  if (did) trial.report({ deviceId: did, ip: req.ip, flags: cleanFlags(req.body && req.body.flags), mismatch }).catch((e) => console.error('[trial] report failed:', e.message));
   res.json({ ok: !mismatch, lock: mismatch && process.env.INTEGRITY_ENFORCE === 'true' });
+});
+
+/*
+ * Trial: first contact of an install starts its clock. No account needed.
+ */
+app.post('/api/v1/device/hello', helloLimit, async (req, res, next) => {
+  try {
+    const deviceId = deviceIdOf(req);
+    if (!deviceId) throw httpError(400, 'A device id is required');
+    const { device } = await trial.hello({
+      deviceId,
+      ip: req.ip,
+      version: String(req.body?.version || req.headers['x-app-version'] || ''),
+      flags: cleanFlags(req.body?.flags)
+    });
+    res.json({ trial: trial.publicTrial(device), trialDays: trial.cfg.days });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
+ * AI subtitles (Premium or active trial). Body: the audio bytes. Query: lang (optional), seconds (duration of the audio).
+ */
+const subtitleLimit = rateLimit({ name: 'subtitles', windowMs: 60 * 1000, max: Number(process.env.SUBS_PER_MINUTE) || 6, key: (req) => req.ip });
+let subsSchemaReady = null;
+function ensureSubsSchema() {
+  subsSchemaReady ??= pool.query(
+    `CREATE TABLE IF NOT EXISTS public.subtitle_jobs (
+       id BIGSERIAL PRIMARY KEY,
+       user_id UUID NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
+       seconds INTEGER NOT NULL,
+       bytes INTEGER NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`
+  ).catch((error) => { subsSchemaReady = null; throw error; });
+  return subsSchemaReady;
+}
+
+app.post('/api/v1/subtitles', subtitleLimit, getUser,
+  express.raw({ type: () => true, limit: sttConfig().maxBytes }),
+  async (req, res, next) => {
+    let jobId = null;
+    try {
+      if (!(await hasPremium(req.user))) {
+        return res.status(402).json({ error: 'AI subtitles need Premium or an active trial', code: 'premium_required' });
+      }
+      const cfg = sttConfig();
+      if (!cfg.key) return res.status(503).json({ error: 'Subtitles are not configured on the server', code: 'stt_not_configured' });
+
+      const audio = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (audio.length < 1024) throw httpError(400, 'No audio received');
+
+      const seconds = Math.min(cfg.maxSeconds, Math.max(1, Math.ceil(Number(req.query.seconds) || 0)));
+      if (!Number(req.query.seconds)) throw httpError(400, 'The duration (seconds) is required');
+      if (Number(req.query.seconds) > cfg.maxSeconds) {
+        return res.status(413).json({ error: 'Audio too long', code: 'too_long', maxSeconds: cfg.maxSeconds });
+      }
+
+      await ensureSubsSchema();
+      if (!isOwner(req.user)) {
+        const used = await pool.query(
+          `SELECT COALESCE(SUM(seconds), 0)::int AS s FROM subtitle_jobs WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
+          [req.user.id]
+        );
+        if (used.rows[0].s + seconds > cfg.dailySeconds) {
+          return res.status(429).json({ error: 'Daily subtitle limit reached', code: 'limit_reached', dailySeconds: cfg.dailySeconds, usedSeconds: used.rows[0].s });
+        }
+      }
+      const job = await pool.query(`INSERT INTO subtitle_jobs (user_id, seconds, bytes) VALUES ($1,$2,$3) RETURNING id`, [req.user.id, seconds, audio.length]);
+      jobId = job.rows[0].id;
+
+      const mime = String(req.headers['content-type'] || 'audio/mp4').split(';')[0].trim();
+      const lang = String(req.query.lang || '');
+      const result = await transcribe({ audio, mime, language: lang, cfg });
+      jobId = null; // success: the usage stays counted
+      res.json({ ...result, srt: toSrt(result.segments) });
+    } catch (error) {
+      if (jobId) await pool.query(`DELETE FROM subtitle_jobs WHERE id = $1`, [jobId]).catch(() => {});
+      next(error);
+    }
+  }
+);
+
+/*
+ * Admin (owner only): abuse log and device bans.
+ */
+app.get('/api/v1/admin/abuse', getUser, async (req, res, next) => {
+  try {
+    if (!isOwner(req.user)) throw httpError(403, 'Owner only');
+    res.json(await trial.recentAbuse(Number(req.query.limit) || 100));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/v1/admin/device/ban', getUser, async (req, res, next) => {
+  try {
+    if (!isOwner(req.user)) throw httpError(403, 'Owner only');
+    const id = cleanDeviceId(req.body?.deviceId);
+    const hash = id ? trial.hashDevice(id) : String(req.body?.deviceHash || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw httpError(400, 'deviceId or deviceHash is required');
+    res.json({ ok: true, deviceHash: hash, ...(await trial.setBan({ deviceHash: hash, banned: req.body?.banned !== false })) });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/v1/me/usage', getUser, async (req, res, next) => {
