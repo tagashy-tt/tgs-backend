@@ -90,3 +90,9 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 - **AI subtitles:** `POST /api/v1/subtitles?seconds=N&lang=es` with the audio bytes as body (Premium or active trial). Needs `STT_API_KEY`.
 - **Tests:** `npm test` needs a PostgreSQL (`TEST_DATABASE_URL`); it wipes that database.
 - Set `TRUST_PROXY=true` and `DEVICE_PEPPER` on Railway.
+
+## 0.5.0 — claimable trial, paid features, subtitle quota
+- `POST /api/v1/trial/claim` (auth): claims the 7-day trial. One claim per device and per account, forever (`device_trials`, `trial_claims`). Reasons the client may see: `device_used`, `account_used`, `has_premium_row`, `no_device`, `not_available` (anything that would help an abuser is returned as `not_available`). Rate limit: `TRIAL_CLAIMS_PER_HOUR` (default low; tests use 100). The device id is a hashed ANDROID_ID with a pepper; a factory reset can change it.
+- Entitlements now report `trial` and `claimable`; the free plan no longer gets weekly uses: `FREE_WEEKLY_TOPAZ/CHECK/DOWNLOAD/DEADFRAMES` default to `0` (set a number to give free uses again). Process and upload patches stay free.
+- Subtitles: `SUBS_MAX_SECONDS` (default 600 per file) and `SUBS_MONTHLY_SECONDS` (default 3600 per month); `GET /api/v1/subtitles/quota`; error `quota_reached`.
+- Migration is automatic on start (new tables, `ends_at` nullable). Needs Postgres; run `node test/run.mjs` with `TEST_DATABASE_URL`.
