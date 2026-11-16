@@ -96,3 +96,8 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 - Entitlements now report `trial` and `claimable`; the free plan no longer gets weekly uses: `FREE_WEEKLY_TOPAZ/CHECK/DOWNLOAD/DEADFRAMES` default to `0` (set a number to give free uses again). Process and upload patches stay free.
 - Subtitles: `SUBS_MAX_SECONDS` (default 600 per file) and `SUBS_MONTHLY_SECONDS` (default 3600 per month); `GET /api/v1/subtitles/quota`; error `quota_reached`.
 - Migration is automatic on start (new tables, `ends_at` nullable). Needs Postgres; run `node test/run.mjs` with `TEST_DATABASE_URL`.
+
+## 0.5.1 — subtitle engines
+- `STT_PROVIDERS` (order) + `STT_<ID>_URL/KEY/MODEL` for `whispercpp`, `fasterwhisper`, `openai`, `groq`; the old `STT_API_KEY` still works. `POST /api/v1/subtitles?engine=<id>` tries that engine first and falls back to the rest; `GET /api/v1/subtitles/quota` lists the engines that are on (`engines`).
+- The projects sensevoice-subtitle-generator, Transcribix, subtitle-generator (asub), auto-subtitles and transcribe are local apps, not hosted APIs: run their engine as a server (whisper.cpp `whisper-server`, a faster-whisper OpenAI-compatible server) and point the URL at it. SenseVoice has no standard server protocol, so it is not wired.
+- Without any engine the app shows "service not enabled" (503 `stt_not_configured`).
