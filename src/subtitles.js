@@ -40,7 +40,8 @@ export function sttConfig(env = process.env) {
     url: String(env.STT_API_URL || 'https://api.openai.com/v1/audio/transcriptions').trim(),
     model: String(env.STT_MODEL || 'whisper-1').trim(),
     maxBytes: Math.min(100 * 1024 * 1024, Math.max(1024 * 1024, Number(env.SUBS_MAX_BYTES) || 24 * 1024 * 1024)),
-    maxSeconds: Math.max(30, Number(env.SUBS_MAX_SECONDS) || 1800),
+    maxSeconds: Math.max(30, Number(env.SUBS_MAX_SECONDS) || 600),
+    monthlySeconds: Math.max(60, Number(env.SUBS_MONTHLY_SECONDS) || 3600),
     dailySeconds: Math.max(60, Number(env.SUBS_DAILY_SECONDS) || 7200),
   };
 }

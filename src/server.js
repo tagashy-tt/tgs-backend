@@ -8,7 +8,7 @@ import { rateLimit, cleanDeviceId, cleanFlags } from './antiabuse.js';
 import { createTrialService } from './trial.js';
 import { transcribe, sttConfig, toSrt } from './subtitles.js';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 
 const { Pool } = pg;
 const app = express();
@@ -712,7 +712,10 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
         try {
           await trial.ensureSchema();
           const d = await trial.getDevice(trial.hashDevice(id));
-          return { ...trial.publicTrial(d), usedByThisAccount: premiumRow?.source === 'trial' };
+          const accountUsed = await trial.accountClaimed(req.user.id);
+          const hasPaidRow = !!premiumRow && premiumRow.source !== 'trial';
+          const pt = trial.publicTrial(d, Date.now(), { accountUsed });
+          return { ...pt, claimable: pt.claimable && !hasPaidRow && !owner, usedByThisAccount: premiumRow?.source === 'trial' };
         } catch { return null; }
       })(),
       features: {
@@ -722,8 +725,12 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
         torrent_downloader: premium,
         premium_tools: premium,
         ai_subtitles: premium,
-        dead_frame_remover: true,
-        cc_lab: true
+        dead_frame_remover: premium,
+        cc_lab: premium,
+        flowframes: premium,
+        topaz: premium,
+        check: premium,
+        downloads: premium
       },
       entitlements: owner
         ? [{
@@ -1363,17 +1370,17 @@ app.post('/api/v1/paypal/webhook', async (req, res, next) => {
 /*
  * Weekly usage limits (server-side, so they survive reinstalling the APK)
  *
- * Free users: topaz 5 / check 5 / download 5 per week. Premium and owner are
+ * Free users: these tools are Premium (limit 0 by default; set FREE_WEEKLY_* to give free accounts a few uses). Premium and owner are
  * unlimited. The week starts on Monday 00:00 in USAGE_TZ.
  * Flow: the app calls /usage/consume BEFORE the job and /usage/refund if the
  * job fails, so a failed job never costs a use.
  */
 
 const USAGE_FEATURES = {
-  topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 5 },
-  check: { env: 'FREE_WEEKLY_CHECK', fallback: 5 },
-  download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 5 },
-  deadframes: { env: 'FREE_WEEKLY_DEADFRAMES', fallback: 5 }
+  topaz: { env: 'FREE_WEEKLY_TOPAZ', fallback: 0 },
+  check: { env: 'FREE_WEEKLY_CHECK', fallback: 0 },
+  download: { env: 'FREE_WEEKLY_DOWNLOAD', fallback: 0 },
+  deadframes: { env: 'FREE_WEEKLY_DEADFRAMES', fallback: 0 }
 };
 
 function usageTimezone() {
@@ -1480,7 +1487,7 @@ app.post('/api/v1/integrity', (req, res) => {
 });
 
 /*
- * Trial: first contact of an install starts its clock. No account needed.
+ * Trial: first contact only REGISTERS the install (no clock starts). The person claims the 7 days while signed in: POST /api/v1/trial/claim.
  */
 app.post('/api/v1/device/hello', helloLimit, async (req, res, next) => {
   try {
@@ -1493,6 +1500,27 @@ app.post('/api/v1/device/hello', helloLimit, async (req, res, next) => {
       flags: cleanFlags(req.body?.flags)
     });
     res.json({ trial: trial.publicTrial(device), trialDays: trial.cfg.days });
+  } catch (error) {
+    next(error);
+  }
+});
+
+const claimLimit = rateLimit({ name: 'trial-claim', windowMs: 60 * 60 * 1000, max: Number(process.env.TRIAL_CLAIMS_PER_HOUR) || 10, key: (req) => req.ip });
+const CLAIM_STATUS = { device_used: 409, account_used: 409, has_premium_row: 409, no_device: 400, device_banned: 403, tampered: 403, emulator: 403, ip_velocity: 403 };
+app.post('/api/v1/trial/claim', claimLimit, getUser, async (req, res, next) => {
+  try {
+    if (isOwner(req.user)) return res.status(409).json({ error: 'The owner account does not need a trial', code: 'has_premium_row' });
+    const deviceId = deviceIdOf(req);
+    if (!deviceId) throw httpError(400, 'A device id is required');
+    const r = await trial.claim({ user: req.user, deviceId, ip: req.ip, version: String(req.headers['x-app-version'] || '') });
+    const d = await trial.getDevice(trial.hashDevice(deviceId));
+    const pub = trial.publicTrial(d, Date.now(), { accountUsed: !r.granted && r.reason === 'account_used' });
+    if (!r.granted) {
+      // the reasons that help an abuser (banned, tampered, emulator, ip) are all answered as 'not_available'
+      const code = ['device_used', 'account_used', 'has_premium_row', 'no_device'].includes(r.reason) ? r.reason : 'not_available';
+      return res.status(CLAIM_STATUS[r.reason] || 403).json({ error: 'The free trial cannot be claimed', code, trial: pub });
+    }
+    res.json({ ok: true, trial: pub, endsAt: r.endsAt });
   } catch (error) {
     next(error);
   }
@@ -1515,6 +1543,27 @@ function ensureSubsSchema() {
   ).catch((error) => { subsSchemaReady = null; throw error; });
   return subsSchemaReady;
 }
+
+/** Minutes of AI subtitles used this calendar month (USAGE_TZ) against the monthly quota of a paid account. */
+async function subtitleQuota(user, cfg = sttConfig()) {
+  await ensureSubsSchema();
+  const r = await pool.query(
+    `SELECT COALESCE(SUM(seconds), 0)::int AS s,
+            ((date_trunc('month', NOW() AT TIME ZONE $2) + INTERVAL '1 month') AT TIME ZONE $2) AS resets_at
+     FROM subtitle_jobs WHERE user_id = $1 AND created_at >= (date_trunc('month', NOW() AT TIME ZONE $2) AT TIME ZONE $2)`,
+    [user.id, usageTimezone()]
+  );
+  const usedSeconds = r.rows[0].s;
+  return { monthlySeconds: cfg.monthlySeconds, usedSeconds, remainingSeconds: Math.max(0, cfg.monthlySeconds - usedSeconds), resetsAt: r.rows[0].resets_at, maxSeconds: cfg.maxSeconds };
+}
+
+app.get('/api/v1/subtitles/quota', getUser, async (req, res, next) => {
+  try {
+    res.json(await subtitleQuota(req.user));
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.post('/api/v1/subtitles', subtitleLimit, getUser,
   express.raw({ type: () => true, limit: sttConfig().maxBytes }),
@@ -1544,6 +1593,10 @@ app.post('/api/v1/subtitles', subtitleLimit, getUser,
         );
         if (used.rows[0].s + seconds > cfg.dailySeconds) {
           return res.status(429).json({ error: 'Daily subtitle limit reached', code: 'limit_reached', dailySeconds: cfg.dailySeconds, usedSeconds: used.rows[0].s });
+        }
+        const q = await subtitleQuota(req.user, cfg);
+        if (q.usedSeconds + seconds > q.monthlySeconds) {
+          return res.status(429).json({ error: 'Monthly subtitle minutes used up', code: 'quota_reached', ...q });
         }
       }
       const job = await pool.query(`INSERT INTO subtitle_jobs (user_id, seconds, bytes) VALUES ($1,$2,$3) RETURNING id`, [req.user.id, seconds, audio.length]);

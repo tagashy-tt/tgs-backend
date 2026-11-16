@@ -1,7 +1,8 @@
-// 7-day free trial tied to the DEVICE (install), with the abuse rules around it.
-//   - the clock starts the first time an install talks to the server (POST /api/v1/device/hello), not at sign-up;
-//   - one trial per device: a second/third account on the same device shares the SAME end date, never a new one;
-//   - at most TRIAL_MAX_ACCOUNTS_PER_DEVICE accounts per device get the trial, the rest are refused and logged;
+// 7-day free trial, CLAIMED on purpose by a signed-in account, with the abuse rules around it.
+//   - nothing starts by itself: the person taps "Claim 7 days" (POST /api/v1/trial/claim) while signed in;
+//   - once per DEVICE, for ever: the first claim marks the device (device_trials.claimed_at); a second account, a reinstall or a
+//     deleted + re-created account on that device gets 'device_used', never a new trial;
+//   - once per ACCOUNT, for ever (trial_claims): the same account cannot claim again from another device;
 //   - at most TRIAL_MAX_DEVICES_PER_IP new devices per IP per 24 h (a farm of reinstalls is refused and logged);
 //   - banned devices, tampered builds (when INTEGRITY_ENFORCE=true) and emulators (when TRIAL_BLOCK_EMULATORS=true) get no trial;
 //   - the trial is a normal 'premium' entitlement row with source 'trial', so every existing check (usage, features) just works,
@@ -24,21 +25,19 @@ export function trialConfig(env = process.env) {
 export const hashWithPepper = (value, pepper) => crypto.createHash('sha256').update(`${pepper}:${value}`).digest('hex');
 
 /**
- * Pure decision: may this account get the trial of this device right now?
- * device = {endsAt: Date|string, banned: boolean, flags: string[]}
- * returns {grant: boolean, reason: string}
+ * Pure decision for a claim. device = {claimedAt, banned, flags}; account = {claimedBefore, hasPaidRow}.
+ * reason: ok | no_device | device_used | account_used | has_premium_row | device_banned | tampered | emulator | ip_velocity
  */
-export function decideTrial({ device, accountRank, hasPremiumRow, now = Date.now(), cfg }) {
+export function decideClaim({ device, account, cfg }) {
   if (!device) return { grant: false, reason: 'no_device' };
-  if (hasPremiumRow) return { grant: false, reason: 'has_premium_row' };
+  if (device.claimedAt) return { grant: false, reason: 'device_used' };
+  if (account?.claimedBefore) return { grant: false, reason: 'account_used' };
+  if (account?.hasPaidRow) return { grant: false, reason: 'has_premium_row' };
   if (device.banned) return { grant: false, reason: 'device_banned' };
   const flags = device.flags || [];
   if (cfg.enforceIntegrity && flags.includes('tampered')) return { grant: false, reason: 'tampered' };
   if (cfg.blockEmulators && flags.includes('emulator')) return { grant: false, reason: 'emulator' };
   if (flags.includes('ip_velocity')) return { grant: false, reason: 'ip_velocity' };
-  const ends = new Date(device.endsAt).getTime();
-  if (!Number.isFinite(ends) || ends <= now) return { grant: false, reason: 'trial_over' };
-  if (accountRank > cfg.maxAccountsPerDevice) return { grant: false, reason: 'multi_account' };
   return { grant: true, reason: 'ok' };
 }
 
@@ -47,7 +46,7 @@ export const daysLeft = (endsAt, now = Date.now()) => {
   return Number.isFinite(t) ? Math.max(0, Math.ceil((t - now) / 86400000)) : 0;
 };
 
-export function createTrialService({ pool, setEntitlement, env = process.env, log = console }) {
+export function createTrialService({ pool, env = process.env, log = console }) {
   const cfg = trialConfig(env);
   let ready = null;
   const done = new Set(); // `${userId}:${deviceHash}` already handled in this process
@@ -65,12 +64,28 @@ export function createTrialService({ pool, setEntitlement, env = process.env, lo
         last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
       await pool.query(`CREATE INDEX IF NOT EXISTS device_trials_ip_idx ON public.device_trials (ip_hash, first_seen)`);
+      // claim model: the clock no longer starts at first contact
+      await pool.query(`ALTER TABLE public.device_trials ALTER COLUMN ends_at DROP NOT NULL`);
+      await pool.query(`ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
+      await pool.query(`ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_by UUID`);
       await pool.query(`CREATE TABLE IF NOT EXISTS public.device_accounts (
         device_hash TEXT NOT NULL,
         user_id UUID NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
         linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (device_hash, user_id)
       )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS public.trial_claims (
+        user_id UUID PRIMARY KEY,
+        device_hash TEXT NOT NULL,
+        claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      // trials that the old (automatic) model already started count as used; devices that never signed anyone in become claimable
+      await pool.query(`UPDATE public.device_trials d SET claimed_at = d.first_seen
+        WHERE d.claimed_at IS NULL AND d.ends_at IS NOT NULL AND EXISTS (SELECT 1 FROM public.device_accounts a WHERE a.device_hash = d.device_hash)`);
+      await pool.query(`UPDATE public.device_trials SET ends_at = NULL WHERE claimed_at IS NULL AND ends_at IS NOT NULL`);
+      await pool.query(`INSERT INTO public.trial_claims (user_id, device_hash, claimed_at)
+        SELECT user_id, COALESCE(external_id, ''), COALESCE(updated_at, NOW()) FROM public.user_entitlements WHERE feature = 'premium' AND source = 'trial'
+        ON CONFLICT (user_id) DO NOTHING`);
       await pool.query(`CREATE TABLE IF NOT EXISTS public.abuse_events (
         id BIGSERIAL PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -93,17 +108,17 @@ export function createTrialService({ pool, setEntitlement, env = process.env, lo
   const hashDevice = (deviceId) => hashWithPepper(deviceId, cfg.pepper);
   const hashIp = (ip) => hashWithPepper(String(ip || ''), cfg.pepper);
 
-  /** First contact of an install: starts its clock (once). Returns the device row as a plain object. */
+  /** First contact of an install: registers the device (no trial starts here). Returns the device row as a plain object. */
   async function hello({ deviceId, ip, version = '', flags = [] }) {
     await ensureSchema();
     const deviceHash = hashDevice(deviceId);
     const ipHash = hashIp(ip);
     const ins = await pool.query(
       `INSERT INTO device_trials (device_hash, ends_at, ip_hash, app_version, flags)
-       VALUES ($1, NOW() + ($2 || ' days')::interval, $3, $4, $5)
+       VALUES ($1, NULL, $2, $3, $4)
        ON CONFLICT (device_hash) DO NOTHING
        RETURNING device_hash`,
-      [deviceHash, String(cfg.days), ipHash, String(version).slice(0, 20), flags]
+      [deviceHash, ipHash, String(version).slice(0, 20), flags]
     );
     if (ins.rowCount) {
       // new device: too many new devices from one IP in 24 h means somebody is farming trials
@@ -123,20 +138,28 @@ export function createTrialService({ pool, setEntitlement, env = process.env, lo
   }
 
   async function getDevice(deviceHash) {
-    const r = await pool.query(`SELECT device_hash, first_seen, ends_at, banned, flags FROM device_trials WHERE device_hash = $1`, [deviceHash]);
+    const r = await pool.query(`SELECT device_hash, first_seen, ends_at, claimed_at, banned, flags FROM device_trials WHERE device_hash = $1`, [deviceHash]);
     const row = r.rows[0];
-    return row ? { deviceHash: row.device_hash, firstSeen: row.first_seen, endsAt: row.ends_at, banned: row.banned, flags: row.flags || [] } : null;
+    return row ? { deviceHash: row.device_hash, firstSeen: row.first_seen, endsAt: row.ends_at, claimedAt: row.claimed_at, banned: row.banned, flags: row.flags || [] } : null;
   }
 
-  /** What the app shows: never leaks reasons that would help an abuser, only active/over and the date. */
-  function publicTrial(device, now = Date.now()) {
-    if (!device) return { active: false, endsAt: null, daysRemaining: 0 };
-    const ends = new Date(device.endsAt).getTime();
-    const active = !device.banned && !(device.flags || []).includes('ip_velocity') && Number.isFinite(ends) && ends > now;
-    return { active, endsAt: device.endsAt, daysRemaining: active ? daysLeft(device.endsAt, now) : 0 };
+  /** What the app shows: never leaks reasons that would help an abuser. claimable is a hint; the claim itself decides. */
+  function publicTrial(device, now = Date.now(), { accountUsed = false } = {}) {
+    if (!device) return { active: false, endsAt: null, daysRemaining: 0, claimed: false, claimable: false, days: cfg.days };
+    const ends = device.endsAt ? new Date(device.endsAt).getTime() : NaN;
+    const blocked = device.banned || (device.flags || []).includes('ip_velocity');
+    const active = !blocked && Number.isFinite(ends) && ends > now;
+    return {
+      active,
+      endsAt: device.endsAt || null,
+      daysRemaining: active ? daysLeft(device.endsAt, now) : 0,
+      claimed: !!device.claimedAt,
+      claimable: !device.claimedAt && !blocked && !accountUsed,
+      days: cfg.days,
+    };
   }
 
-  /** Called when an authenticated request carries a device id. Grants the trial entitlement when the rules allow. */
+  /** Called when an authenticated request carries a device id. It only LINKS the account to the device (and logs odd multi-account use): the trial is never granted here. */
   async function onAuthed({ user, deviceId, ip, version = '' }) {
     if (!user || !deviceId) return { granted: false, reason: 'no_device_id' };
     const deviceHash = hashDevice(deviceId);
@@ -151,19 +174,64 @@ export function createTrialService({ pool, setEntitlement, env = process.env, lo
          AND linked_at <= (SELECT linked_at FROM device_accounts WHERE device_hash = $1 AND user_id = $2)`,
       [deviceHash, user.id]
     )).rows[0].n;
-    const hasRow = (await pool.query(`SELECT 1 FROM user_entitlements WHERE user_id = $1 AND feature = 'premium' LIMIT 1`, [user.id])).rowCount > 0;
-    const d = decideTrial({ device, accountRank: rank, hasPremiumRow: hasRow, cfg });
-    if (d.grant) {
-      await setEntitlement(user.id, 'premium', true, { source: 'trial', expires_at: new Date(device.endsAt).toISOString(), external_id: deviceHash.slice(0, 16) });
-      log.log?.(`[trial] ${user.email} got the trial until ${new Date(device.endsAt).toISOString()}`);
-    } else if (['multi_account', 'tampered', 'emulator', 'device_banned', 'ip_velocity'].includes(d.reason)) {
-      await event(d.reason, { deviceHash, userId: user.id, detail: { rank } });
-    }
-    if (d.reason !== 'no_device') done.add(key);
-    return { granted: d.grant, reason: d.reason };
+    if (rank > cfg.maxAccountsPerDevice) await event('multi_account', { deviceHash, userId: user.id, detail: { rank } });
+    done.add(key);
+    return { granted: false, reason: 'claim_required' };
   }
 
-  /** The app reports its own environment (integrity check, emulator/root hints). Flags are recorded; blocking is decided by decideTrial. */
+  /** Has this account ever claimed (or used the old automatic) trial? */
+  async function accountClaimed(userId) {
+    await ensureSchema();
+    return (await pool.query(`SELECT 1 FROM trial_claims WHERE user_id = $1`, [userId])).rowCount > 0;
+  }
+
+  /**
+   * The person taps "Claim 7 days". One transaction: the device is marked first (atomic, only if nobody claimed it), then the account.
+   * Returns {granted, reason, endsAt?}. Refusals are logged as abuse events when they look like abuse.
+   */
+  async function claim({ user, deviceId, ip, version = '' }) {
+    if (!user) return { granted: false, reason: 'no_user' };
+    if (!deviceId) return { granted: false, reason: 'no_device' };
+    await ensureSchema();
+    const { deviceHash, device } = await hello({ deviceId, ip, version });
+    const claimedBefore = await accountClaimed(user.id);
+    const hasPaidRow = (await pool.query(`SELECT 1 FROM user_entitlements WHERE user_id = $1 AND feature = 'premium' AND source <> 'trial' LIMIT 1`, [user.id])).rowCount > 0;
+    const d = decideClaim({ device, account: { claimedBefore, hasPaidRow }, cfg });
+    if (!d.grant) {
+      if (['device_used', 'account_used', 'tampered', 'emulator', 'device_banned', 'ip_velocity'].includes(d.reason)) await event(`claim_${d.reason}`, { deviceHash, userId: user.id });
+      return { granted: false, reason: d.reason };
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const upd = await client.query(
+        `UPDATE device_trials SET claimed_at = NOW(), claimed_by = $2, ends_at = NOW() + ($3 || ' days')::interval
+         WHERE device_hash = $1 AND claimed_at IS NULL RETURNING ends_at`,
+        [deviceHash, user.id, String(cfg.days)]
+      );
+      if (!upd.rowCount) { await client.query('ROLLBACK'); return { granted: false, reason: 'device_used' }; }
+      const ins = await client.query(`INSERT INTO trial_claims (user_id, device_hash) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING RETURNING user_id`, [user.id, deviceHash]);
+      if (!ins.rowCount) { await client.query('ROLLBACK'); return { granted: false, reason: 'account_used' }; }
+      const endsAt = new Date(upd.rows[0].ends_at).toISOString();
+      // inside the same transaction: the claim is never consumed without the premium row
+      await client.query(
+        `INSERT INTO user_entitlements (user_id, feature, active, source, expires_at, external_id, updated_at)
+         VALUES ($1, 'premium', TRUE, 'trial', $2, $3, NOW())
+         ON CONFLICT (user_id, feature) DO UPDATE SET active = TRUE, source = 'trial', expires_at = EXCLUDED.expires_at, external_id = EXCLUDED.external_id, updated_at = NOW()`,
+        [user.id, endsAt, deviceHash.slice(0, 16)]
+      );
+      await client.query('COMMIT');
+      log.log?.(`[trial] ${user.email} claimed the trial until ${endsAt}`);
+      return { granted: true, reason: 'ok', endsAt };
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** The app reports its own environment (integrity check, emulator/root hints). Flags are recorded; blocking is decided by decideClaim. */
   async function report({ deviceId, ip, flags = [], mismatch = false }) {
     if (!deviceId) return;
     await ensureSchema();
@@ -200,5 +268,5 @@ export function createTrialService({ pool, setEntitlement, env = process.env, lo
     return { counts, events: rows };
   }
 
-  return { cfg, ensureSchema, hello, getDevice, publicTrial, onAuthed, report, setBan, recentAbuse, hashDevice, hashIp };
+  return { cfg, ensureSchema, hello, getDevice, publicTrial, onAuthed, claim, accountClaimed, report, setBan, recentAbuse, hashDevice, hashIp };
 }
