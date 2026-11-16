@@ -1559,7 +1559,7 @@ async function subtitleQuota(user, cfg = sttConfig()) {
 
 app.get('/api/v1/subtitles/quota', getUser, async (req, res, next) => {
   try {
-    res.json(await subtitleQuota(req.user));
+    res.json({ ...(await subtitleQuota(req.user)), engines: sttConfig().providers.map(p => p.id) });
   } catch (error) {
     next(error);
   }
@@ -1574,7 +1574,7 @@ app.post('/api/v1/subtitles', subtitleLimit, getUser,
         return res.status(402).json({ error: 'AI subtitles need Premium or an active trial', code: 'premium_required' });
       }
       const cfg = sttConfig();
-      if (!cfg.key) return res.status(503).json({ error: 'Subtitles are not configured on the server', code: 'stt_not_configured' });
+      if (!cfg.providers.length) return res.status(503).json({ error: 'Subtitles are not configured on the server', code: 'stt_not_configured' });
 
       const audio = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
       if (audio.length < 1024) throw httpError(400, 'No audio received');
@@ -1604,7 +1604,7 @@ app.post('/api/v1/subtitles', subtitleLimit, getUser,
 
       const mime = String(req.headers['content-type'] || 'audio/mp4').split(';')[0].trim();
       const lang = String(req.query.lang || '');
-      const result = await transcribe({ audio, mime, language: lang, cfg });
+      const result = await transcribe({ audio, mime, language: lang, cfg, engine: String(req.query.engine || '').toLowerCase() });
       jobId = null; // success: the usage stays counted
       res.json({ ...result, srt: toSrt(result.segments) });
     } catch (error) {
