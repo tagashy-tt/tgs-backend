@@ -101,3 +101,23 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 - `STT_PROVIDERS` (order) + `STT_<ID>_URL/KEY/MODEL` for `whispercpp`, `fasterwhisper`, `openai`, `groq`; the old `STT_API_KEY` still works. `POST /api/v1/subtitles?engine=<id>` tries that engine first and falls back to the rest; `GET /api/v1/subtitles/quota` lists the engines that are on (`engines`).
 - The projects sensevoice-subtitle-generator, Transcribix, subtitle-generator (asub), auto-subtitles and transcribe are local apps, not hosted APIs: run their engine as a server (whisper.cpp `whisper-server`, a faster-whisper OpenAI-compatible server) and point the URL at it. SenseVoice has no standard server protocol, so it is not wired.
 - Without any engine the app shows "service not enabled" (503 `stt_not_configured`).
+
+
+## 0.5.2 — server-authoritative account and usage enforcement
+
+- Keep the 7-day Premium trial as a **manual claim** (`POST /api/v1/trial/claim`). Registration/login never starts the clock. `TRIAL_DAYS` defaults to 7.
+- The trial is limited to one claim per account and one claim per stable device ID. The Android app sends the SHA-256 of Android `ANDROID_ID` (plus app namespace); the backend hashes it again with `DEVICE_PEPPER`. Reinstalling the app does not normally change Android ID. A factory reset, device replacement, or a modified client can still change/spoof identifiers; this is abuse resistance, not unbreakable hardware attestation.
+- Keep `DEVICE_PEPPER` stable across deployments. Changing it makes existing device hashes appear new and weakens device-level trial history.
+- `TRIAL_MAX_DEVICES_PER_IP` defaults to 8 per 24 hours. Configure `TRIAL_BLOCK_EMULATORS` and `INTEGRITY_ENFORCE` only after testing legitimate-device false positives.
+- Weekly usage counters live in PostgreSQL and are keyed by account, feature and week. The Android app no longer falls back to a local counter to authorize Topaz/Check/Download. These actions require sign-in and a successful live backend check; if Railway is unavailable, they fail closed instead of resetting limits.
+- `FREE_WEEKLY_TOPAZ`, `FREE_WEEKLY_CHECK`, `FREE_WEEKLY_DOWNLOAD`, and `FREE_WEEKLY_DEADFRAMES` remain server-side controls (default 0). Premium/trial/owner accounts are unlimited for these counters. Do not change the PayPal plan IDs or prices as part of this release.
+- Existing subscription, Lifetime and payment webhook logic is intentionally unchanged.
+
+### Deployment
+
+1. Deploy `TGS BACKEND 0.5.2` to the existing Railway service and retain the same PostgreSQL volume/database.
+2. Preserve the existing `DEVICE_PEPPER`, `APP_BASE_URL`, PayPal credentials, plan IDs and webhook configuration. Do not rotate secrets during this update.
+3. Confirm `/health` reports version `0.5.2`, then test registration, manual trial claim, reinstall/login, repeated claim refusal, usage snapshots, and paid/Lifetime entitlement checks.
+4. Build Android `1.1.1` only after the backend is deployed. The app uses the existing Railway base URL.
+
+The app-side usage checks are a deterrent against ordinary reinstall/reset bypasses, not a substitute for enforcing paid features on the server that actually performs a cloud job. Local-only processing cannot be made fully tamper-proof by a remote quota check alone.
