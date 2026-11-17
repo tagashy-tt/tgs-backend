@@ -103,6 +103,12 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 - Without any engine the app shows "service not enabled" (503 `stt_not_configured`).
 
 
+## 0.5.3 — Dead Frame Remover analysis on the server
+- `POST /api/v1/deadframes/analyze?sens=0..2&minMs=300` (Bearer token, Premium or active trial). Body = the video bytes (max `DEADFRAMES_MAX_MB`, default 150). Runs ffmpeg `freezedetect` and answers `{cuts:[{startMs,endMs}], deadFrames, totalFrames, removedMs, durationMs, fps}`; the phone cuts the video.
+- The Dockerfile now installs `ffmpeg` (Alpine package, includes ffprobe). Redeploy the image, not just the code.
+- Env: `DEADFRAMES_MAX_MB`, `DEADFRAMES_PER_MINUTE` (default 4 per IP), `DEADFRAMES_CONCURRENCY` (default 2 at once).
+- AI subtitles need at least one speech-to-text provider configured (see `.env.example`: Groq has a free tier). Without one the app shows "subtitles not enabled on the server".
+
 ## 0.5.2 — server-authoritative account and usage enforcement
 
 - Keep the 7-day Premium trial as a **manual claim** (`POST /api/v1/trial/claim`). Registration/login never starts the clock. `TRIAL_DAYS` defaults to 7.
