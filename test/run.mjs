@@ -66,7 +66,7 @@ const signup = async (email, device, ip = '10.0.0.1') => {
 const dev = (c) => `device-${c}-aaaaaaaaaaaaaaaaaaaaaaaa`;
 
 try {
-  const h = await call('/health'); assert.equal(h.json.version, '0.5.0'); ok('health reports 0.5.0');
+  const h = await call('/health'); assert.equal(h.json.version, '0.5.2'); ok('health reports 0.5.2');
 
   // 1. hello only registers the device: no clock starts
   const hello = await call('/api/v1/device/hello', { method: 'POST', body: { deviceId: dev('A'), version: '1.1.0' }, ip: '10.0.0.1' });
