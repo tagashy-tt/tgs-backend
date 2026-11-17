@@ -7,8 +7,9 @@ import bcrypt from 'bcryptjs';
 import { rateLimit, cleanDeviceId, cleanFlags } from './antiabuse.js';
 import { createTrialService } from './trial.js';
 import { transcribe, sttConfig, toSrt } from './subtitles.js';
+import { analyzeFrozen } from './deadframes.js';
 
-const VERSION = '0.5.2';
+const VERSION = '0.5.3';
 
 const { Pool } = pg;
 const app = express();
@@ -1609,6 +1610,32 @@ app.post('/api/v1/subtitles', subtitleLimit, getUser,
       res.json({ ...result, srt: toSrt(result.segments) });
     } catch (error) {
       if (jobId) await pool.query(`DELETE FROM subtitle_jobs WHERE id = $1`, [jobId]).catch(() => {});
+      next(error);
+    }
+  }
+);
+
+/*
+ * Dead Frame Remover analysis on the server (Premium or active trial). Body: the video bytes. Query: sens (0-2), minMs.
+ * Only the frozen spans come back; the phone does the cutting.
+ */
+const deadFramesLimit = rateLimit({ name: 'deadframes', windowMs: 60 * 1000, max: Number(process.env.DEADFRAMES_PER_MINUTE) || 4, key: (req) => req.ip });
+const DEADFRAMES_MAX_BYTES = (Number(process.env.DEADFRAMES_MAX_MB) || 150) * 1024 * 1024;
+let deadFramesBusy = 0;
+app.post('/api/v1/deadframes/analyze', deadFramesLimit, getUser,
+  express.raw({ type: () => true, limit: DEADFRAMES_MAX_BYTES }),
+  async (req, res, next) => {
+    try {
+      if (!(await hasPremium(req.user))) return res.status(402).json({ error: 'Dead Frame Remover on the server needs Premium or an active trial', code: 'premium_required' });
+      const video = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (video.length < 2048) throw httpError(400, 'No video received');
+      if (deadFramesBusy >= (Number(process.env.DEADFRAMES_CONCURRENCY) || 2)) return res.status(503).json({ error: 'The server is busy, try again in a minute', code: 'busy' });
+      deadFramesBusy++;
+      try {
+        res.json(await analyzeFrozen(video, { sensitivity: Number(req.query.sens) || 0, minFreezeMs: Math.min(5000, Math.max(100, Number(req.query.minMs) || 300)) }));
+      } finally { deadFramesBusy--; }
+    } catch (error) {
+      if (/ffmpeg|ffprobe|ENOENT/.test(String(error?.message))) return res.status(422).json({ error: 'The video could not be analysed', code: 'analyze_failed' });
       next(error);
     }
   }
