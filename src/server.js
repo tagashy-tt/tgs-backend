@@ -8,7 +8,7 @@ import { rateLimit, cleanDeviceId, cleanFlags } from './antiabuse.js';
 import { createTrialService } from './trial.js';
 import { transcribe, sttConfig, toSrt } from './subtitles.js';
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.2';
 
 const { Pool } = pg;
 const app = express();
@@ -75,7 +75,7 @@ const helloLimit = rateLimit({ name: 'hello', windowMs: 60 * 60 * 1000, max: 40 
 const trial = createTrialService({ pool, setEntitlement: (...a) => setEntitlement(...a) });
 const deviceIdOf = (req) => cleanDeviceId(req.headers['x-device-id'] || req.body?.deviceId);
 
-/** Never blocks a request: a failure in the trial logic is logged and the request goes on. */
+/** Links the authenticated account to its stable device ID. Trial eligibility is checked atomically by /trial/claim. */
 async function trialHook(req, user) {
   try {
     await trial.onAuthed({ user, deviceId: deviceIdOf(req), ip: req.ip, version: String(req.headers['x-app-version'] || '') });

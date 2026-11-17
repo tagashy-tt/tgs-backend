@@ -204,6 +204,12 @@ export function createTrialService({ pool, env = process.env, log = console }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Preserve the account/device relationship even if the normal auth hook
+      // was interrupted before this explicit trial claim.
+      await client.query(
+        `INSERT INTO device_accounts (device_hash, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [deviceHash, user.id]
+      );
       const upd = await client.query(
         `UPDATE device_trials SET claimed_at = NOW(), claimed_by = $2, ends_at = NOW() + ($3 || ' days')::interval
          WHERE device_hash = $1 AND claimed_at IS NULL RETURNING ends_at`,
