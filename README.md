@@ -129,7 +129,7 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 The app-side usage checks are a deterrent against ordinary reinstall/reset bypasses, not a substitute for enforcing paid features on the server that actually performs a cloud job. Local-only processing cannot be made fully tamper-proof by a remote quota check alone.
 
 
-## 0.5.4 — beta gift fix, safe trial migration, diagnostics
+## 0.5.5 — beta gift fix, safe trial migration, diagnostics
 
 - **Beta emails (`BETA_PREMIUM_EMAILS`)**: the list is now parsed with a regex, so `"a@x.com","b@x.com"`, one email per line, `<a@x.com>`, `;` or spaces all work (before, inner quotes made emails never match).
   The gift is also given to accounts whose old premium row is **expired/inactive** or is an **active 7-day trial** (0.5.3 skipped any account with any premium row, which is why newly added emails "did nothing").

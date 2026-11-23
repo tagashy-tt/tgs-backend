@@ -1,7 +1,7 @@
 
 {
   "name": "tay-studio-premium-backend",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Backend for TAY'S STUDIO Premium, Railway PostgreSQL, PayPal and feature entitlements",
   "type": "module",
   "scripts": {
