@@ -38,6 +38,7 @@ const env = {
   ...process.env, PORT: String(PORT), DATABASE_URL: DB, DATABASE_SSL: 'disable', PAYPAL_CLIENT_ID: 'x', PAYPAL_CLIENT_SECRET: 'x', APP_BASE_URL: 'http://localhost',
   OWNER_EMAIL: 'owner@test.dev', STT_API_KEY: 'test-key', STT_API_URL: `http://127.0.0.1:${STT_PORT}/v1/audio/transcriptions`, SUBS_DAILY_SECONDS: '120', SUBS_MAX_SECONDS: '100', SUBS_MONTHLY_SECONDS: '200',
   TRIAL_MAX_DEVICES_PER_IP: '5', TRUST_PROXY: 'true', SUBS_PER_MINUTE: '30', TRIAL_CLAIMS_PER_HOUR: '100',
+  BETA_PREMIUM_EMAILS: '"beta1@test.dev","Beta2@Test.dev"\n  beta3@test.dev; <beta4@test.dev> , beta5@test.dev',
 };
 const srv = spawn('node', ['src/server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 let logs = ''; srv.stdout.on('data', (d) => (logs += d)); srv.stderr.on('data', (d) => (logs += d));
@@ -66,7 +67,7 @@ const signup = async (email, device, ip = '10.0.0.1') => {
 const dev = (c) => `device-${c}-aaaaaaaaaaaaaaaaaaaaaaaa`;
 
 try {
-  const h = await call('/health'); assert.equal(h.json.version, '0.5.2'); ok('health reports 0.5.2');
+  const h = await call('/health'); assert.equal(h.json.version, '0.5.4'); ok('health reports 0.5.4');
 
   // 1. hello only registers the device: no clock starts
   const hello = await call('/api/v1/device/hello', { method: 'POST', body: { deviceId: dev('A'), version: '1.1.0' }, ip: '10.0.0.1' });
@@ -190,6 +191,26 @@ try {
   const tR1 = await signup('race1@test.dev', dev('R'), '10.0.0.11'); const tR2 = await signup('race2@test.dev', dev('R'), '10.0.0.11');
   const race = await Promise.all([call('/api/v1/trial/claim', { method: 'POST', token: tR1, device: dev('R') }), call('/api/v1/trial/claim', { method: 'POST', token: tR2, device: dev('R') })]);
   assert.deepEqual(race.map((r) => r.status).sort(), [200, 409]); ok('two simultaneous claims on one device: only one wins');
+
+
+  // 10b. beta gift: list parsing (quotes, case, new lines, <>), expired rows, active paid rows, diagnostics
+  const tB1 = await signup('beta1@test.dev', dev('B1'), '10.0.1.1');
+  e = await call('/api/v1/me/entitlements', { token: tB1, device: dev('B1') });
+  assert.equal(e.json.premium, true); assert.ok(e.json.daysRemaining >= 364); ok('beta: an email written with quotes in the list gets the gift');
+  const tB2 = await signup('beta2@test.dev', dev('B2'), '10.0.1.2');
+  e = await call('/api/v1/me/entitlements', { token: tB2, device: dev('B2') }); assert.equal(e.json.premium, true); ok('beta: list is case-insensitive');
+  const tB3 = await signup('beta3@test.dev', dev('B3'), '10.0.1.3');
+  await pool.query(`INSERT INTO user_entitlements (user_id, feature, active, source, expires_at) SELECT id, 'premium', FALSE, 'paypal_subscription', NOW() - INTERVAL '10 days' FROM app_users WHERE email = 'beta3@test.dev'`);
+  e = await call('/api/v1/me/entitlements', { token: tB3, device: dev('B3') }); assert.equal(e.json.premium, true); ok('beta: an account with an EXPIRED premium row now gets the gift (0.5.3 skipped it)');
+  const tB4 = await signup('beta4@test.dev', dev('B4'), '10.0.1.4');
+  await pool.query(`INSERT INTO user_entitlements (user_id, feature, active, source, expires_at) SELECT id, 'premium', TRUE, 'paypal_lifetime', NULL FROM app_users WHERE email = 'beta4@test.dev'`);
+  e = await call('/api/v1/me/entitlements', { token: tB4, device: dev('B4') }); assert.equal(e.json.plan, 'lifetime'); ok('beta: an active lifetime row is never replaced');
+  const tB5 = await signup('beta5@test.dev', dev('B5'), '10.0.1.5');
+  await pool.query(`INSERT INTO user_entitlements (user_id, feature, active, source, expires_at) SELECT id, 'premium', TRUE, 'trial', NOW() + INTERVAL '2 days' FROM app_users WHERE email = 'beta5@test.dev'`);
+  e = await call('/api/v1/me/entitlements', { token: tB5, device: dev('B5') }); assert.ok(e.json.daysRemaining >= 364); assert.notEqual(e.json.plan, 'trial'); ok('beta: an active 7-day trial is upgraded to the beta gift');
+  const dg = await call('/api/v1/admin/diagnostics', { token: owTok });
+  assert.equal(dg.status, 200, JSON.stringify(dg.json)); assert.equal(dg.json.trialSchema.ok, true); assert.equal(dg.json.betaCount, 5); assert.equal(dg.json.beta.find((b) => b.email === 'beta4@test.dev').reason, 'has_active_premium'); ok('diagnostics: owner sees schema status and why each beta email does/does not get the gift');
+  assert.equal((await call('/api/v1/admin/diagnostics', { token: tB1, device: dev('B1') })).status, 403); ok('diagnostics: customers get 403');
 
   // 11. rate limit on register
   let last;
