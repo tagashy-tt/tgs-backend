@@ -9,7 +9,7 @@ import { createTrialService } from './trial.js';
 import { transcribe, sttConfig, toSrt } from './subtitles.js';
 import { analyzeFrozen } from './deadframes.js';
 
-const VERSION = '0.5.3';
+const VERSION = '0.5.4';
 
 const { Pool } = pg;
 const app = express();
@@ -199,22 +199,40 @@ function configuredSubscriptionPlan(plan) {
 }
 
 /*
- * Beta-tester gift: BETA_PREMIUM_EMAILS = emails separated by comma, space or new line.
- * The first time one of them signs in (or already has a session) and has NO premium row yet,
- * they receive BETA_PREMIUM_DAYS days (default 365) of Premium, once. Paid, lifetime or
- * previously gifted rows are never touched. The email is not verified yet, so only use
- * addresses you trust (or set BETA_PREMIUM_REQUIRE_VERIFIED=true once verification exists).
+ * Beta-tester gift: BETA_PREMIUM_EMAILS = emails separated by comma, space, semicolon or new line
+ * (quotes, <angle brackets> and stray spaces around each email are ignored).
+ * The first time one of them makes an authenticated request, they receive BETA_PREMIUM_DAYS days
+ * (default 365) of Premium when they have NO currently-active Premium that should be kept:
+ *   - no premium row yet                      -> gift
+ *   - an expired / inactive row               -> gift (0.5.3 skipped these: that is why added emails "did nothing")
+ *   - an active 7-day trial                   -> gift (replaces the trial, the trial claim stays used)
+ *   - an active paid / lifetime / manual row  -> untouched
+ *   - an earlier beta gift (any state)        -> untouched (once per account) unless BETA_PREMIUM_REGRANT=true
+ * The email is not verified yet, so only use addresses you trust (or set BETA_PREMIUM_REQUIRE_VERIFIED=true).
  */
 const betaGiftDone = new Set();
 const betaGiftWarned = new Set();
 
+const EMAIL_RE = /[^\s,;"'<>()\[\]{}]+@[^\s,;"'<>()\[\]{}]+/g;
+
 function betaGiftEmails() {
-  return new Set(
-    env('BETA_PREMIUM_EMAILS')
-      .split(/[\s,;]+/)
-      .map(normalizeEmail)
-      .filter(Boolean)
-  );
+  const raw = String(process.env.BETA_PREMIUM_EMAILS ?? '');
+  return new Set((raw.match(EMAIL_RE) || []).map(normalizeEmail).filter(Boolean));
+}
+
+function betaGiftDays() {
+  return Math.min(3650, Math.max(1, Math.floor(Number(env('BETA_PREMIUM_DAYS')) || 365)));
+}
+
+/** Pure decision (also used by the diagnostics route): what would the gift do with this account's premium row? */
+function betaGiftDecision(row, { regrant = false, now = Date.now() } = {}) {
+  if (!row) return { grant: true, reason: 'no_row' };
+  const expires = row.expires_at ? new Date(row.expires_at).getTime() : null;
+  const live = Boolean(row.active) && (expires === null || (Number.isFinite(expires) && expires > now));
+  if (row.source === 'beta_gift' && !regrant) return { grant: false, reason: 'already_gifted' };
+  if (!live) return { grant: true, reason: 'row_inactive_or_expired' };
+  if (row.source === 'trial') return { grant: true, reason: 'replaces_trial' };
+  return { grant: false, reason: 'has_active_premium' };
 }
 
 async function grantBetaGift(user) {
@@ -242,28 +260,23 @@ async function grantBetaGift(user) {
       return;
     }
 
-    const days = Math.min(
-      3650,
-      Math.max(1, Math.floor(Number(env('BETA_PREMIUM_DAYS')) || 365))
-    );
-
     const existing = await pool.query(
-      `SELECT 1 FROM user_entitlements
+      `SELECT source, active, expires_at FROM user_entitlements
        WHERE user_id = $1 AND feature = 'premium'
        LIMIT 1`,
       [user.id]
     );
+    const decision = betaGiftDecision(existing.rows[0], { regrant: env('BETA_PREMIUM_REGRANT') === 'true' });
 
-    if (existing.rowCount > 0) {
-      console.log(`[beta-gift] ${user.email} already has a premium row, nothing granted (delete it in user_entitlements to gift)`);
-    }
-
-    if (existing.rowCount === 0) {
+    if (decision.grant) {
+      const days = betaGiftDays();
       await setEntitlement(user.id, 'premium', true, {
         source: 'beta_gift',
         expires_at: new Date(Date.now() + days * 86400000).toISOString()
       });
-      console.log(`[beta-gift] ${days} days of Premium granted to ${user.email}`);
+      console.log(`[beta-gift] ${days} days of Premium granted to ${user.email} (${decision.reason})`);
+    } else {
+      console.log(`[beta-gift] ${user.email}: nothing granted (${decision.reason})`);
     }
 
     betaGiftDone.add(user.id);
@@ -717,7 +730,7 @@ app.get('/api/v1/me/entitlements', getUser, async (req, res, next) => {
           const hasPaidRow = !!premiumRow && premiumRow.source !== 'trial';
           const pt = trial.publicTrial(d, Date.now(), { accountUsed });
           return { ...pt, claimable: pt.claimable && !hasPaidRow && !owner, usedByThisAccount: premiumRow?.source === 'trial' };
-        } catch { return null; }
+        } catch (e) { console.error('[trial] entitlements trial block failed:', e.schemaStep || '', e.code || '', e.message); return null; }
       })(),
       features: {
         processing_methods: true,
@@ -1665,6 +1678,34 @@ app.post('/api/v1/admin/device/ban', getUser, async (req, res, next) => {
   }
 });
 
+/*
+ * Owner-only diagnostics: does the trial schema migrate, and why would each BETA_PREMIUM_EMAILS address (not) get its gift?
+ */
+app.get('/api/v1/admin/diagnostics', getUser, async (req, res, next) => {
+  try {
+    if (!isOwner(req.user)) throw httpError(403, 'Owner only');
+    let trialSchema = { ok: true };
+    try { await trial.ensureSchema(); } catch (e) { trialSchema = { ok: false, step: e.schemaStep || null, code: e.code || null, message: e.message }; }
+    const emails = [...betaGiftEmails()];
+    const regrant = env('BETA_PREMIUM_REGRANT') === 'true';
+    const beta = [];
+    for (const email of emails) {
+      const u = (await pool.query(`SELECT id, email_verified_at FROM app_users WHERE lower(email) = $1 LIMIT 1`, [email])).rows[0];
+      if (!u) { beta.push({ email, account: false, result: 'no_account_yet (the gift is given the first time that account signs in)' }); continue; }
+      const row = (await pool.query(`SELECT source, active, expires_at FROM user_entitlements WHERE user_id = $1 AND feature = 'premium'`, [u.id])).rows[0] || null;
+      const d = betaGiftDecision(row, { regrant });
+      beta.push({
+        email, account: true, premiumRow: row ? { source: row.source, active: row.active, expiresAt: row.expires_at } : null,
+        wouldGrant: d.grant, reason: d.reason,
+        blockedByVerification: env('BETA_PREMIUM_REQUIRE_VERIFIED') === 'true' && !u.email_verified_at
+      });
+    }
+    res.json({ version: VERSION, trialSchema, betaDays: betaGiftDays(), betaCount: emails.length, beta });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/v1/me/usage', getUser, async (req, res, next) => {
   try {
     res.json(await usageSnapshot(req.user));
@@ -1844,11 +1885,11 @@ app.get('/api/v1/torrent/policy', getUser, async (req, res, next) => {
  * Error handling
  */
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
   const status = Number(error.status) || 500;
 
   if (status >= 500) {
-    console.error('Backend error:', error.message);
+    console.error(`Backend error on ${req.method} ${req.path}:`, error.schemaStep ? `[step: ${error.schemaStep}]` : '', error.code || '', error.message);
   }
 
   const body = {

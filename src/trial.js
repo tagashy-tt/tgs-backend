@@ -51,9 +51,9 @@ export function createTrialService({ pool, env = process.env, log = console }) {
   let ready = null;
   const done = new Set(); // `${userId}:${deviceHash}` already handled in this process
 
-  function ensureSchema() {
-    ready ??= (async () => {
-      await pool.query(`CREATE TABLE IF NOT EXISTS public.device_trials (
+  // Each step has a name so a failure shows WHICH statement broke (see /api/v1/admin/diagnostics and the Railway logs).
+  const SCHEMA_STEPS = [
+    ['device_trials table', `CREATE TABLE IF NOT EXISTS public.device_trials (
         device_hash TEXT PRIMARY KEY,
         first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         ends_at TIMESTAMPTZ NOT NULL,
@@ -62,31 +62,31 @@ export function createTrialService({ pool, env = process.env, log = console }) {
         flags TEXT[] NOT NULL DEFAULT '{}',
         app_version TEXT,
         last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
-      await pool.query(`CREATE INDEX IF NOT EXISTS device_trials_ip_idx ON public.device_trials (ip_hash, first_seen)`);
-      // claim model: the clock no longer starts at first contact
-      await pool.query(`ALTER TABLE public.device_trials ALTER COLUMN ends_at DROP NOT NULL`);
-      await pool.query(`ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
-      await pool.query(`ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_by UUID`);
-      await pool.query(`CREATE TABLE IF NOT EXISTS public.device_accounts (
+      )`],
+    ['device_trials ip index', `CREATE INDEX IF NOT EXISTS device_trials_ip_idx ON public.device_trials (ip_hash, first_seen)`],
+    // claim model: the clock no longer starts at first contact
+    ['ends_at nullable', `ALTER TABLE public.device_trials ALTER COLUMN ends_at DROP NOT NULL`],
+    ['claimed_at column', `ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`],
+    ['claimed_by column', `ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_by UUID`],
+    ['device_accounts table', `CREATE TABLE IF NOT EXISTS public.device_accounts (
         device_hash TEXT NOT NULL,
         user_id UUID NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
         linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (device_hash, user_id)
-      )`);
-      await pool.query(`CREATE TABLE IF NOT EXISTS public.trial_claims (
+      )`],
+    ['trial_claims table', `CREATE TABLE IF NOT EXISTS public.trial_claims (
         user_id UUID PRIMARY KEY,
         device_hash TEXT NOT NULL,
         claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
-      // trials that the old (automatic) model already started count as used; devices that never signed anyone in become claimable
-      await pool.query(`UPDATE public.device_trials d SET claimed_at = d.first_seen
-        WHERE d.claimed_at IS NULL AND d.ends_at IS NOT NULL AND EXISTS (SELECT 1 FROM public.device_accounts a WHERE a.device_hash = d.device_hash)`);
-      await pool.query(`UPDATE public.device_trials SET ends_at = NULL WHERE claimed_at IS NULL AND ends_at IS NOT NULL`);
-      await pool.query(`INSERT INTO public.trial_claims (user_id, device_hash, claimed_at)
+      )`],
+    // trials that the old (automatic) model already started count as used; devices that never signed anyone in become claimable
+    ['legacy: mark used devices', `UPDATE public.device_trials d SET claimed_at = d.first_seen
+        WHERE d.claimed_at IS NULL AND d.ends_at IS NOT NULL AND EXISTS (SELECT 1 FROM public.device_accounts a WHERE a.device_hash = d.device_hash)`],
+    ['legacy: unclaimed devices', `UPDATE public.device_trials SET ends_at = NULL WHERE claimed_at IS NULL AND ends_at IS NOT NULL`],
+    ['legacy: accounts that had a trial', `INSERT INTO public.trial_claims (user_id, device_hash, claimed_at)
         SELECT user_id, COALESCE(external_id, ''), COALESCE(updated_at, NOW()) FROM public.user_entitlements WHERE feature = 'premium' AND source = 'trial'
-        ON CONFLICT (user_id) DO NOTHING`);
-      await pool.query(`CREATE TABLE IF NOT EXISTS public.abuse_events (
+        ON CONFLICT (user_id) DO NOTHING`],
+    ['abuse_events table', `CREATE TABLE IF NOT EXISTS public.abuse_events (
         id BIGSERIAL PRIMARY KEY,
         kind TEXT NOT NULL,
         device_hash TEXT,
@@ -94,7 +94,35 @@ export function createTrialService({ pool, env = process.env, log = console }) {
         ip_hash TEXT,
         detail JSONB NOT NULL DEFAULT '{}',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
+      )`],
+  ];
+  let lastSchemaError = null;
+
+  function ensureSchema() {
+    ready ??= (async () => {
+      // One connection + a transaction-level advisory lock: when two Railway containers start together (a deploy)
+      // or two requests race, the second one waits instead of colliding on CREATE TABLE / ALTER TABLE.
+      const client = await pool.connect();
+      let step = 'connect';
+      try {
+        await client.query('BEGIN');
+        step = 'lock';
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('tgs_trial_schema'))`);
+        for (const [name, sql] of SCHEMA_STEPS) {
+          step = name;
+          await client.query(sql);
+        }
+        await client.query('COMMIT');
+        lastSchemaError = null;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        e.schemaStep = step;
+        lastSchemaError = { step, code: e.code || null, message: e.message };
+        log.error?.(`[trial] schema step "${step}" failed (${e.code || 'no code'}): ${e.message}`);
+        throw e;
+      } finally {
+        client.release();
+      }
     })().catch((e) => { ready = null; throw e; });
     return ready;
   }
@@ -274,5 +302,5 @@ export function createTrialService({ pool, env = process.env, log = console }) {
     return { counts, events: rows };
   }
 
-  return { cfg, ensureSchema, hello, getDevice, publicTrial, onAuthed, claim, accountClaimed, report, setBan, recentAbuse, hashDevice, hashIp };
+  return { cfg, ensureSchema, schemaStatus: () => lastSchemaError, hello, getDevice, publicTrial, onAuthed, claim, accountClaimed, report, setBan, recentAbuse, hashDevice, hashIp };
 }
