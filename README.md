@@ -127,3 +127,14 @@ See `.env.example`. For lifetime purchases set `PAYPAL_LIFETIME_PRICE_USD` to th
 4. Build Android `1.1.1` only after the backend is deployed. The app uses the existing Railway base URL.
 
 The app-side usage checks are a deterrent against ordinary reinstall/reset bypasses, not a substitute for enforcing paid features on the server that actually performs a cloud job. Local-only processing cannot be made fully tamper-proof by a remote quota check alone.
+
+
+## 0.5.4 — beta gift fix, safe trial migration, diagnostics
+
+- **Beta emails (`BETA_PREMIUM_EMAILS`)**: the list is now parsed with a regex, so `"a@x.com","b@x.com"`, one email per line, `<a@x.com>`, `;` or spaces all work (before, inner quotes made emails never match).
+  The gift is also given to accounts whose old premium row is **expired/inactive** or is an **active 7-day trial** (0.5.3 skipped any account with any premium row, which is why newly added emails "did nothing").
+  Active paid / lifetime / manual Premium is never replaced; an earlier beta gift is not repeated unless `BETA_PREMIUM_REGRANT=true`.
+  After changing the variable in Railway, redeploy/restart so the new value is loaded.
+- **Trial 500**: the trial tables migration now runs in one transaction under a Postgres advisory lock (two containers starting during a deploy used to collide with `duplicate key ... pg_class_relname_nsp_index`), and each step is named in the logs.
+- **`GET /api/v1/admin/diagnostics`** (owner Bearer token): shows if the trial schema migrates (and the failing step), and for every email in `BETA_PREMIUM_EMAILS` whether the account exists and why it would or would not be gifted.
+- 500 errors now log the route (`Backend error on POST /api/v1/trial/claim: [step: ...] code message`) so Railway logs show the exact cause.
