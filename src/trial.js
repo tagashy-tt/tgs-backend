@@ -8,6 +8,7 @@
 //   - the trial is a normal 'premium' entitlement row with source 'trial', so every existing check (usage, features) just works,
 //     and a paid/gifted/lifetime row is never touched.
 import crypto from 'node:crypto';
+import { userIdType } from './schema.js';
 
 const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
 
@@ -52,7 +53,7 @@ export function createTrialService({ pool, env = process.env, log = console }) {
   const done = new Set(); // `${userId}:${deviceHash}` already handled in this process
 
   // Each step has a name so a failure shows WHICH statement broke (see /api/v1/admin/diagnostics and the Railway logs).
-  const SCHEMA_STEPS = [
+  const schemaSteps = (T) => [
     ['device_trials table', `CREATE TABLE IF NOT EXISTS public.device_trials (
         device_hash TEXT PRIMARY KEY,
         first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -67,15 +68,16 @@ export function createTrialService({ pool, env = process.env, log = console }) {
     // claim model: the clock no longer starts at first contact
     ['ends_at nullable', `ALTER TABLE public.device_trials ALTER COLUMN ends_at DROP NOT NULL`],
     ['claimed_at column', `ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`],
-    ['claimed_by column', `ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_by UUID`],
+    ['claimed_by column', `ALTER TABLE public.device_trials ADD COLUMN IF NOT EXISTS claimed_by ${T}`],
+    ['claimed_by type', `ALTER TABLE public.device_trials ALTER COLUMN claimed_by TYPE ${T} USING claimed_by::text::${T}`],
     ['device_accounts table', `CREATE TABLE IF NOT EXISTS public.device_accounts (
         device_hash TEXT NOT NULL,
-        user_id UUID NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
+        user_id ${T} NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
         linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (device_hash, user_id)
       )`],
     ['trial_claims table', `CREATE TABLE IF NOT EXISTS public.trial_claims (
-        user_id UUID PRIMARY KEY,
+        user_id ${T} PRIMARY KEY,
         device_hash TEXT NOT NULL,
         claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`],
@@ -90,7 +92,7 @@ export function createTrialService({ pool, env = process.env, log = console }) {
         id BIGSERIAL PRIMARY KEY,
         kind TEXT NOT NULL,
         device_hash TEXT,
-        user_id UUID,
+        user_id ${T},
         ip_hash TEXT,
         detail JSONB NOT NULL DEFAULT '{}',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -102,13 +104,14 @@ export function createTrialService({ pool, env = process.env, log = console }) {
     ready ??= (async () => {
       // One connection + a transaction-level advisory lock: when two Railway containers start together (a deploy)
       // or two requests race, the second one waits instead of colliding on CREATE TABLE / ALTER TABLE.
+      const T = await userIdType(pool);
       const client = await pool.connect();
       let step = 'connect';
       try {
         await client.query('BEGIN');
         step = 'lock';
         await client.query(`SELECT pg_advisory_xact_lock(hashtext('tgs_trial_schema'))`);
-        for (const [name, sql] of SCHEMA_STEPS) {
+        for (const [name, sql] of schemaSteps(T)) {
           step = name;
           await client.query(sql);
         }

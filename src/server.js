@@ -6,10 +6,11 @@ import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { rateLimit, cleanDeviceId, cleanFlags } from './antiabuse.js';
 import { createTrialService } from './trial.js';
+import { userIdType } from './schema.js';
 import { transcribe, sttConfig, toSrt } from './subtitles.js';
 import { analyzeFrozen } from './deadframes.js';
 
-const VERSION = '0.5.4';
+const VERSION = '0.5.5';
 
 const { Pool } = pg;
 const app = express();
@@ -1411,9 +1412,9 @@ function usageLimit(feature) {
 let usageSchemaReady = null;
 
 function ensureUsageSchema() {
-  usageSchemaReady ??= pool.query(
+  usageSchemaReady ??= userIdType(pool).then((T) => pool.query(
     `CREATE TABLE IF NOT EXISTS public.usage_counters (
-       user_id UUID NOT NULL REFERENCES public.app_users(id)
+       user_id ${T} NOT NULL REFERENCES public.app_users(id)
          ON DELETE CASCADE,
        feature TEXT NOT NULL,
        week_start DATE NOT NULL,
@@ -1421,7 +1422,7 @@ function ensureUsageSchema() {
        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        PRIMARY KEY (user_id, feature, week_start)
      )`
-  ).catch(error => {
+  )).catch(error => {
     usageSchemaReady = null;
     throw error;
   });
@@ -1546,15 +1547,15 @@ app.post('/api/v1/trial/claim', claimLimit, getUser, async (req, res, next) => {
 const subtitleLimit = rateLimit({ name: 'subtitles', windowMs: 60 * 1000, max: Number(process.env.SUBS_PER_MINUTE) || 6, key: (req) => req.ip });
 let subsSchemaReady = null;
 function ensureSubsSchema() {
-  subsSchemaReady ??= pool.query(
+  subsSchemaReady ??= userIdType(pool).then((T) => pool.query(
     `CREATE TABLE IF NOT EXISTS public.subtitle_jobs (
        id BIGSERIAL PRIMARY KEY,
-       user_id UUID NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
+       user_id ${T} NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
        seconds INTEGER NOT NULL,
        bytes INTEGER NOT NULL,
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`
-  ).catch((error) => { subsSchemaReady = null; throw error; });
+  )).catch((error) => { subsSchemaReady = null; throw error; });
   return subsSchemaReady;
 }
 
